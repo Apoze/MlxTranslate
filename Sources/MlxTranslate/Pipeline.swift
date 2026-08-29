@@ -223,6 +223,7 @@ enum Pipeline {
             samples: samples,
             backend: command.asr,
             language: command.language,
+            videoPath: command.video.path,
             progress: { fraction, message in gate.report("asr", fraction, message) }
         )
         var records: [ChunksRecord.ChunkRecord] = []

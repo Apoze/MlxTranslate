@@ -7,20 +7,28 @@ import HuggingFace
 //   voxtral   — Voxtral Mini 4B Realtime via sidecar python (uv, audité,
 //               par-fenêtre avec deltas) ;
 //   voxtral4b — même modèle, natif Swift (fp16), sans python ;
-//   qwen3asr  — Qwen3-ASR 0,6B 4-bit (mlx-community), test qualité.
+//   qwen3asr  — Qwen3-ASR 0,6B 4-bit (mlx-community), test qualité ;
+//   qwen3asrja— Qwen3-ASR 1,7B-JA (spécialisé japonais) ;
+//   voxtral3b — Voxtral Mini 3B (mzbac) via script python (mlx_voxtral),
+//               forçage de langue fort (prompt lang:ja) ; ASR offline par
+//               défaut pour la traduction de vidéos.
 
 enum ASRBackend: String, CaseIterable, Sendable {
     case voxtral = "voxtral"
     case voxtral4b = "voxtral4b"
     case qwen3asr = "qwen3asr"
+    case qwen3asrja = "qwen3asrja"
+    case voxtral3b = "voxtral3b"
 
-    static let `default` = ASRBackend.voxtral
+    static let `default` = ASRBackend.voxtral3b
 
     var displayName: String {
         switch self {
-        case .voxtral: "Voxtral 4B Realtime (sidecar)"
+        case .voxtral: "Voxtral 4B Realtime (sidecar, direct)"
         case .voxtral4b: "Voxtral 4B Realtime fp16 (Swift)"
         case .qwen3asr: "Qwen3-ASR 0,6B (Swift)"
+        case .qwen3asrja: "Qwen3-ASR 1,7B-JA (Swift, spécialisé japonais)"
+        case .voxtral3b: "Voxtral Mini 3B (python, forçage langue fort)"
         }
     }
 
@@ -42,11 +50,14 @@ enum ASR {
     /// Transcrit l'audio fenêtre par fenêtre (30 s) et retourne le texte
     /// par fenêtre + le texte complet (contrôle de cohérence).
     /// `language` : langue forcée ("ja" par défaut, "auto" = pas de forçage).
+    /// `videoPath` : chemin vidéo/audio (utilisé par les backends python,
+    /// ex. voxtral3b qui ré-extrait l'audio côté python).
     static func transcribe(
         windows: [Audio.Window],
         samples: [Float],
         backend: ASRBackend,
         language: String = "ja",
+        videoPath: String = "",
         progress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ASRResult {
         switch backend {
@@ -62,7 +73,19 @@ enum ASR {
                 progress: progress
             )
         case .qwen3asr:
-            return try await transcribeQwen3ASR(windows: windows, language: language, progress: progress)
+            return try await transcribeQwen3ASR(
+                windows: windows, modelID: "mlx-community/Qwen3-ASR-0.6B-4bit",
+                language: language, progress: progress
+            )
+        case .qwen3asrja:
+            return try await transcribeQwen3ASR(
+                windows: windows, modelID: "ph0ryn/Qwen3-ASR-1.7B-JA-MLX-8bit",
+                language: language, progress: progress
+            )
+        case .voxtral3b:
+            return try await transcribeVoxtral3B(
+                videoPath: videoPath, language: language, progress: progress
+            )
         }
     }
 
@@ -231,12 +254,14 @@ enum ASR {
 
     private static func transcribeQwen3ASR(
         windows: [Audio.Window],
+        modelID: String,
         language: String,
         progress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ASRResult {
-        progress(0.05, "Chargement Qwen3-ASR…")
-        let model = try await Qwen3ASRModel.fromPretrained("mlx-community/Qwen3-ASR-0.6B-4bit")
-        progress(0.3, "Modèle Qwen3-ASR prêt")
+        progress(0.05, "Chargement \(modelID)…")
+        let model = try await Qwen3ASRModel.fromPretrained(modelID)
+        progress(0.3, "Modèle ASR prêt")
+        let backend = modelID.contains("1.7B") ? ASRBackend.qwen3asrja : ASRBackend.qwen3asr
         var chunkTexts: [String] = []
         for (index, window) in windows.enumerated() {
             let parameters = STTGenerateParameters(
@@ -259,9 +284,91 @@ enum ASR {
             )
         }
         return ASRResult(
-            backend: .qwen3asr,
+            backend: backend,
             chunkTexts: chunkTexts,
             fullText: chunkTexts.joined(separator: " "),
+            windowSeconds: 20
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // Voxtral Mini 3B (python, mlx_voxtral) — forçage de langue fort
+    // (prompt lang:ja). ASR offline par défaut. Le script python ré-extrait
+    // l'audio du média et transcrit fenêtre par fenêtre ; l'outil Swift ne
+    // fait que l'appeler (subprocess), comme pour le sidecar.
+    // ------------------------------------------------------------------
+
+    private static func transcribeVoxtral3B(
+        videoPath: String,
+        language: String,
+        progress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> ASRResult {
+        guard !videoPath.isEmpty else {
+            throw Pipeline.PipelineError.transcriptionFailed("chemin vidéo absent (backend voxtral3b)")
+        }
+        let env = ProcessInfo.processInfo.environment
+        let interpreter = env["MLXTRANSLATE_PY3B"]
+            ?? "/Users/maz/Documents/deepseek/.transcript-work/.venv/bin/python"
+        let script = env["MLXTRANSLATE_3B_SCRIPT"]
+            ?? "/Users/maz/Documents/deepseek/MlxTranslate/python/asr_3b.py"
+        let hfHome = env["MLXTRANSLATE_3B_HF_HOME"]
+            ?? "/Users/maz/Documents/deepseek/.transcript-work/hf-home"
+        let outJSON = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mlxtranslate_3b_\(UUID().uuidString).json").path
+
+        progress(0.02, "ASR 3B : lancement python…")
+        guard FileManager.default.isExecutableFile(atPath: interpreter) else {
+            throw Pipeline.PipelineError.transcriptionFailed("interpréteur python introuvable : \(interpreter)")
+        }
+        guard FileManager.default.isReadableFile(atPath: script) else {
+            throw Pipeline.PipelineError.transcriptionFailed("script 3B introuvable : \(script)")
+        }
+
+        let texts: [String] = try await Task.detached(priority: .userInitiated) { () -> [String] in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: interpreter)
+            process.arguments = [
+                script, "--video", videoPath, "--window", "20",
+                "--lang", language, "--out", outJSON,
+            ]
+            var procEnv = env
+            procEnv["HF_HOME"] = hfHome
+            procEnv["TRANSFORMERS_CACHE"] = hfHome
+            process.environment = procEnv
+            let pipe = Pipe()
+            process.standardError = pipe
+            process.standardOutput = pipe
+            do {
+                try process.run()
+            } catch {
+                throw Pipeline.PipelineError.transcriptionFailed(
+                    "lancement python impossible : \(error.localizedDescription)"
+                )
+            }
+            process.waitUntilExit()
+            let output = String(
+                decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self
+            )
+            guard process.terminationStatus == 0 else {
+                throw Pipeline.PipelineError.transcriptionFailed(
+                    "script 3B en échec : \(output.suffix(500).trimmingCharacters(in: .whitespacesAndNewlines))"
+                )
+            }
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: outJSON)),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let arr = obj["texts"] as? [String]
+            else {
+                throw Pipeline.PipelineError.transcriptionFailed("JSON 3B invalide (\(outJSON))")
+            }
+            try? FileManager.default.removeItem(atPath: outJSON)
+            return arr
+        }.value
+
+        progress(1.0, "ASR 3B : \(texts.count) fenêtres")
+        return ASRResult(
+            backend: .voxtral3b,
+            chunkTexts: texts,
+            fullText: texts.joined(separator: " "),
             windowSeconds: 20
         )
     }
