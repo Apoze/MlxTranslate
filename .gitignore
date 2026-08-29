@@ -1,0 +1,11 @@
+# Build
+.build/
+*.xcodeproj
+Package.resolved
+
+# macOS
+.DS_Store
+
+# Exécution locale
+~.mlxtranslate/
+*.log

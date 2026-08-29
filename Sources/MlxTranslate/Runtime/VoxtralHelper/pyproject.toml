@@ -1,0 +1,7 @@
+[project]
+name = "whisperasr-voxtral-helper"
+version = "0.0.0"
+requires-python = "==3.12.*"
+dependencies = [
+  "mlx-audio[stt,server] @ git+https://github.com/Blaizzy/mlx-audio.git@04151c6abb74b886f879a4457ccdc96761f10102",
+]
