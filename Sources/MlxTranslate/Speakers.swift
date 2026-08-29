@@ -51,7 +51,7 @@ enum Speakers {
                 label
             ))
         }
-        try (lines.joined(separator: "\n") + "\n").written(to: url, atomically: true, encoding: .utf8)
+        try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
     private static func label(forSpeakerID id: Int, in spans: [HighQualityDiarizationSpan]) -> String {
@@ -105,7 +105,11 @@ enum Speakers {
         return totals
             .sorted { $0.value > $1.value }
             .map { entry in
-                (speakerID: entry.key, label: labels[entry.key], total: entry.value)
+                (
+                    speakerID: entry.key,
+                    label: labels[entry.key] ?? nil,
+                    total: entry.value
+                )
             }
     }
 

@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.2
 import PackageDescription
 
 // MlxTranslate — pipeline local de sous-titrage :
@@ -14,6 +14,10 @@ let package = Package(
     platforms: [.macOS("15.0")],
     products: [
         .executable(name: "mlxtranslate", targets: ["MlxTranslate"]),
+    ],
+    traits: [
+        // Génère le bundle de ressources (Bundle.module) pour la cible.
+        .init(name: "SwiftModuleResourceBundle"),
     ],
     dependencies: [
         // MLX (piles pinnées identiques à whisperASR).
@@ -49,5 +53,6 @@ let package = Package(
                 .linkedFramework("Foundation"),
             ]
         ),
-    ]
+    ],
+    swiftLanguageModes: [.v5],
 )

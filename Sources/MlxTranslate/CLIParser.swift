@@ -91,14 +91,18 @@ enum CLIParser {
                 names = arguments[index + 1]
                 index += 1
             case "--glossaire":
-                guard index + 1 < arguments.count else { throw unknown("--glossaire sans valeur") }
-                glossary = URL(fileURLWithPath: arguments[index + 1].expandingTildeInPath)
+                guard index + 1 < arguments.count else { throw unknown("glossaire sans valeur") }
+                glossary = URL(
+                    fileURLWithPath: NSString(string: arguments[index + 1]).expandingTildeInPath as String
+                )
                 index += 1
-            case where argument.hasPrefix("-"):
+            case _ where argument.hasPrefix("-"):
                 throw unknown("option inconnue : \(argument)")
             default:
                 guard video == nil else { throw unknown("média en double : \(argument)") }
-                video = URL(fileURLWithPath: argument.expandingTildeInPath)
+                video = URL(
+                    fileURLWithPath: NSString(string: argument).expandingTildeInPath as String
+                )
             }
             index += 1
         }
@@ -117,7 +121,7 @@ enum CLIParser {
     }
 
     private static func unknown(_ detail: String) -> LocalizedError {
-        UnknownArgument(detail)
+        UnknownArgument(detail: detail)
     }
 
     struct UnknownArgument: LocalizedError {
@@ -127,7 +131,7 @@ enum CLIParser {
 }
 
 extension LocalMLXTranslator.Candidate {
-    static func cliValue(_ raw: String) throws -> Candidate {
+    static func cliValue(_ raw: String) throws -> Self {
         switch raw.lowercased() {
         case "qwen25-7b", "qwen2.5-7b", "qwen2_5_7b": return .qwen2_5_7B
         case "qwen3-8b", "qwen3_8b": return .qwen3_8B
@@ -135,7 +139,7 @@ extension LocalMLXTranslator.Candidate {
         case "gemma-12b", "gemma12b", "translategemma-12b": return .translateGemma12B
         case "gemma-4b", "gemma4b", "translategemma-4b": return .translateGemma4B
         default:
-            throw CLIParser.UnknownArgument("modèle inconnu : \(raw)")
+            throw CLIParser.UnknownArgument(detail: "modèle inconnu : \(raw)")
         }
     }
 }

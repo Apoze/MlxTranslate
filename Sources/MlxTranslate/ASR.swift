@@ -99,7 +99,7 @@ enum ASR {
                     progress(0.9, "fenêtre \(windowIndex)/\(windows.count)")
                     break
                 case .failed(let message):
-                    throw PipelineError.transcriptionFailed(message)
+                    throw Pipeline.PipelineError.transcriptionFailed(message)
                 case .ready, .emissionMarker:
                     continue
                 }
@@ -111,7 +111,7 @@ enum ASR {
             backend: .voxtral,
             chunkTexts: chunkTexts,
             fullText: fullText,
-            windowSeconds: 30
+            windowSeconds: 20
         )
     }
 
@@ -136,7 +136,7 @@ enum ASR {
                 topK: 0,
                 verbose: false,
                 language: "ja",
-                chunkDuration: 30,
+                chunkDuration: 20,
                 minChunkDuration: 1
             )
             let output = await Task.detached(priority: .userInitiated) {
@@ -153,7 +153,7 @@ enum ASR {
             backend: .voxtral4b,
             chunkTexts: chunkTexts,
             fullText: fullText,
-            windowSeconds: 30
+            windowSeconds: 20
         )
     }
 
@@ -177,7 +177,7 @@ enum ASR {
                 topK: 0,
                 verbose: false,
                 language: "ja",
-                chunkDuration: 30,
+                chunkDuration: 20,
                 minChunkDuration: 1
             )
             let output = await Task.detached(priority: .userInitiated) {
@@ -193,7 +193,7 @@ enum ASR {
             backend: .qwen3asr,
             chunkTexts: chunkTexts,
             fullText: chunkTexts.joined(separator: " "),
-            windowSeconds: 30
+            windowSeconds: 20
         )
     }
 }

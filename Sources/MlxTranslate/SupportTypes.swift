@@ -372,15 +372,15 @@ struct HighQualityTranslationBatch: Codable, Equatable, Sendable {
         source = try values.decode(HighQualitySourceProvenance.self, forKey: .source)
         turns = try values.decode([HighQualityTranslationTurn].self, forKey: .turns)
         glossary = try values.decode([HighQualityGlossaryPromptTerm].self, forKey: .glossary)
-        glossaryByCueID = values.decodeIfPresent(
+        glossaryByCueID = try values.decodeIfPresent(
             [String: [HighQualityGlossaryPromptTerm]].self,
             forKey: .glossaryByCueID
         ) ?? Self.cueLocalGlossary(turns: turns, glossary: glossary)
-        conversationContextByCueID = values.decodeIfPresent(
+        conversationContextByCueID = try values.decodeIfPresent(
             [String: HighQualityConversationContextEvidence].self,
             forKey: .conversationContextByCueID
         ) ?? [:]
-        retryReasonCodes = values.decodeIfPresent(
+        retryReasonCodes = try values.decodeIfPresent(
             [String: [HighQualityTranslationIntegrityReasonCode]].self,
             forKey: .retryReasonCodes
         )

@@ -75,7 +75,7 @@ enum SRT {
             }
             blocks.append("\(cue.index)\n\(formatTime(cue.start)) --> \(formatTime(cue.end))\n" + lines.joined(separator: "\n"))
         }
-        try (blocks.joined(separator: "\n\n") + "\n").written(to: url, atomically: true, encoding: .utf8)
+        try (blocks.joined(separator: "\n\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
     /// Découpe un texte en phrases aux caractères finaux (on garde le final
@@ -174,7 +174,7 @@ enum SRT {
         let candidates = text.indices.filter { sentenceEnders.contains(text[$0]) }
         let middle = text.count / 2
         let splitPoint: Int
-        if let nearest = candidates.min(by: { abs($0.distance(to: text.startIndex) - middle) < abs($1.distance(to: text.startIndex) - middle) }) {
+        if let nearest = candidates.min(by: { abs(text.distance(from: $0, to: text.startIndex) - middle) < abs(text.distance(from: $1, to: text.startIndex) - middle) }) {
             var point = text.distance(from: text.startIndex, to: nearest) + 1
             var index = text.index(text.startIndex, offsetBy: point)
             while index < text.endIndex, sentenceEnders.contains(text[index]) {

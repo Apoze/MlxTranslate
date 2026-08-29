@@ -4,6 +4,9 @@ import Foundation
 // côte à côte de la vidéo, RTTM des parlants, traduction locale.
 
 enum Pipeline {
+    /// Fenêtres d'ASR : l'aligneur Qwen3 impose 20 s maximum par ancre.
+    static let windowSeconds = 20
+
     enum PipelineError: LocalizedError {
         case mediaNotFound(String)
         case audioMissing(String)
@@ -38,7 +41,7 @@ enum Pipeline {
 
     static var homeURL: URL {
         if let override = ProcessInfo.processInfo.environment["MLXTRANSLATE_HOME"] {
-            return URL(fileURLWithPath: override.expandingTildeInPath)
+            return URL(fileURLWithPath: NSString(string: override).expandingTildeInPath as String)
         }
         return URL(fileURLWithPath: NSString(string: "~/.mlxtranslate").expandingTildeInPath)
     }
@@ -64,7 +67,7 @@ enum Pipeline {
     static func findLatestRun(for video: URL) -> URL? {
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: runsDirectory,
-            includingPropertiesForKeys: [.creationKey]
+            includingPropertiesForKeys: [.contentModificationDateKey]
         ) else { return nil }
         var best: URL?
         var bestDate = Date.distantPast
@@ -73,9 +76,9 @@ enum Pipeline {
             guard let data = try? Data(contentsOf: chunks),
                   let record = try? JSONDecoder().decode(ChunksRecord.self, from: data),
                   URL(fileURLWithPath: record.video) == video else { continue }
-            if let creation = try? entry.resourceValues(forKeys: [.creationKey]).creationDate,
-               creation > bestDate {
-                bestDate = creation
+            let values = try? entry.resourceValues(forKeys: Set([URLResourceKey.contentModificationDateKey]))
+            if let modification = values?.contentModificationDate, modification > bestDate {
+                bestDate = modification
                 best = entry
             }
         }
@@ -189,7 +192,7 @@ enum Pipeline {
     static func transcribe(_ command: Command) async throws {
         let run = try makeRunDirectory()
         let samples = try ensureAudio(video: command.video, run: run)
-        let windows = Audio.windows(samples, seconds: 30)
+        let windows = Audio.windows(samples, seconds: windowSeconds)
         let gate = ProgressGate()
         let result = try await ASR.transcribe(
             windows: windows,
@@ -210,7 +213,7 @@ enum Pipeline {
             ChunksRecord(
                 video: command.video.path,
                 asr: command.asr.rawValue,
-                windowSeconds: 30,
+                windowSeconds: windowSeconds,
                 chunks: records,
                 fullText: result.fullText
             ),
@@ -280,7 +283,8 @@ enum Pipeline {
 
     @discardableResult
     static func diarize(_ command: Command) async throws -> URL {
-        let run = findLatestRun(for: command.video) ?? (try makeRunDirectory())
+        let existing = findLatestRun(for: command.video)
+        let run = try existing ?? makeRunDirectory()
         let samples = try ensureAudio(video: command.video, run: run)
         let policy = command.speakerCount
             .map(HighQualitySpeakerCountPolicy.expected)
@@ -429,8 +433,8 @@ enum Pipeline {
                     start: cue.start,
                     end: cue.end
                 ) else { continue }
-                let label = names?[speaker] ?? letterLabel(for: speaker, in: speakerSegments)
-                prefixes[String(cue.index)] = "[\(label)]"
+                let label = (names ?? [:])[speaker] ?? letterLabel(for: speaker, in: speakerSegments)
+                prefixes?[String(cue.index)] = "[\(label)]"
             }
         }
         let enCues = zip(cues, english).map { cue, text in

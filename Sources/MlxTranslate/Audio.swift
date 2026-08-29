@@ -32,7 +32,7 @@ enum Audio {
         ]
         let pipe = Pipe()
         process.standardError = pipe
-        let errorHandle = FileHandle(forWriting: pipe.fileHandleForReading)
+        let errorHandle = pipe.fileHandleForReading
         do {
             try process.run()
             stderrData = try errorHandle.readDataToEndOfFile()
@@ -67,26 +67,38 @@ enum Audio {
         var dataLength = 0
         while offset + 8 <= data.count {
             let chunkID = String(decoding: data[offset..<offset + 4], as: UTF8.self)
-            let chunkSize = Int(littleEndian: data.subdata(in: (offset + 4)..<(offset + 8)).withUnsafeBytes {
-                $0.load(as: UInt32.self)
-            })
+            let chunkSize = Int(
+                UInt32(
+                    littleEndian: data[(offset + 4)..<(offset + 8)].withUnsafeBytes {
+                        $0.load(as: UInt32.self)
+                    }
+                )
+            )
             let payloadStart = offset + 8
             guard payloadStart + min(chunkSize, data.count - payloadStart) <= data.count else { break }
             switch chunkID {
             case "fmt ":
                 guard payloadStart + 16 <= data.count else { break }
-                formatCode = Int(littleEndian: data[payloadStart...payloadStart + 1].withUnsafeBytes {
-                    $0.load(as: UInt16.self)
-                })
-                channels = Int(littleEndian: data[(payloadStart + 2)..<(payloadStart + 4)].withUnsafeBytes {
-                    $0.load(as: UInt16.self)
-                })
-                sampleRateHz = Int(littleEndian: data[(payloadStart + 4)..<(payloadStart + 8)].withUnsafeBytes {
-                    $0.load(as: UInt32.self)
-                })
-                bitsPerSample = Int(littleEndian: data[(payloadStart + 14)..<(payloadStart + 16)].withUnsafeBytes {
-                    $0.load(as: UInt16.self)
-                })
+                formatCode = UInt16(
+                    littleEndian: data[payloadStart...(payloadStart + 1)].withUnsafeBytes {
+                        $0.load(as: UInt16.self)
+                    }
+                )
+                channels = UInt16(
+                    littleEndian: data[(payloadStart + 2)..<(payloadStart + 4)].withUnsafeBytes {
+                        $0.load(as: UInt16.self)
+                    }
+                )
+                sampleRateHz = UInt32(
+                    littleEndian: data[(payloadStart + 4)..<(payloadStart + 8)].withUnsafeBytes {
+                        $0.load(as: UInt32.self)
+                    }
+                )
+                bitsPerSample = UInt16(
+                    littleEndian: data[(payloadStart + 14)..<(payloadStart + 16)].withUnsafeBytes {
+                        $0.load(as: UInt16.self)
+                    }
+                )
             case "data":
                 dataStart = payloadStart
                 dataLength = chunkSize
@@ -105,46 +117,66 @@ enum Audio {
             throw AudioError.wavMalformed("chunk data tronqué")
         }
         let payload = data[start..<(start + dataLength)]
-        switch bitsPerSample {
-        case 16:
-            return payload.withUnsafeBytes { buffer -> [Float] in
-                let count = buffer.count / 2
-                var samples = [Float](repeating: 0, count: count)
-                for i in 0..<count {
-                    samples[i] = Float(buffer[i * 2...]) / 32_768
-                }
-                return samples
-            }
-        case 32 where formatCode == 3:
-            return payload.withUnsafeBytes { buffer -> [Float] in
-                let count = buffer.count / 4
-                var samples = [Float](repeating: 0, count: count)
-                for i in 0..<count {
-                    samples[i] = buffer[i * 4...]
-                }
-                return samples
-            }
-        case 32:
-            return payload.withUnsafeBytes { buffer -> [Float] in
-                let count = buffer.count / 4
-                var samples = [Float](repeating: 0, count: count)
-                for i in 0..<count {
-                    samples[i] = Float(Int(bitPattern: buffer[i * 4...])) / 2_147_483_648
-                }
-                return samples
-            }
-        case 24:
-            return payload.withUnsafeBytes { buffer -> [Float] in
-                let count = buffer.count / 3
-                var samples = [Float](repeating: 0, count: count)
-                for i in 0..<count {
-                    let value = Int32(buffer[i * 3]) | (Int32(buffer[i * 3 + 1]) << 8) | (Int32(buffer[i * 3 + 2]) << 16)
-                    samples[i] = Float(value >> 8) / 8_388_608
-                }
-                return samples
-            }
+        switch (bitsPerSample, formatCode) {
+        case (16, _):
+            return decodePCM16(payload)
+        case (32, 3):
+            return decodeFloat32(payload)
+        case (32, _):
+            return decodeInt32(payload)
+        case (24, _):
+            return decodePCM24(payload)
         default:
             throw AudioError.wavUnsupportedFormat("\(bitsPerSample) bits/échantillon")
+        }
+    }
+
+    private static func decodePCM16(_ payload: Data) -> [Float] {
+        payload.withUnsafeBytes { buffer in
+            let count = buffer.count / 2
+            var samples = [Float](repeating: 0, count: count)
+            for i in 0..<count {
+                let value = Int16(bitPattern: buffer.load(fromByteOffset: i * 2, as: UInt16.self))
+                samples[i] = Float(value) / 32_768
+            }
+            return samples
+        }
+    }
+
+    private static func decodeFloat32(_ payload: Data) -> [Float] {
+        payload.withUnsafeBytes { buffer in
+            let count = buffer.count / 4
+            var samples = [Float](repeating: 0, count: count)
+            for i in 0..<count {
+                samples[i] = Float(bitPattern: buffer.load(fromByteOffset: i * 4, as: UInt32.self))
+            }
+            return samples
+        }
+    }
+
+    private static func decodeInt32(_ payload: Data) -> [Float] {
+        payload.withUnsafeBytes { buffer in
+            let count = buffer.count / 4
+            var samples = [Float](repeating: 0, count: count)
+            for i in 0..<count {
+                let value = Int32(bitPattern: buffer.load(fromByteOffset: i * 4, as: UInt32.self))
+                samples[i] = Float(value) / 2_147_483_648
+            }
+            return samples
+        }
+    }
+
+    private static func decodePCM24(_ payload: Data) -> [Float] {
+        payload.withUnsafeBytes { buffer in
+            let count = buffer.count / 3
+            var samples = [Float](repeating: 0, count: count)
+            for i in 0..<count {
+                let value = Int32(buffer[i * 3])
+                    | (Int32(buffer[i * 3 + 1]) << 8)
+                    | (Int32(buffer[i * 3 + 2]) << 16)
+                samples[i] = Float(value >> 8) / 8_388_608
+            }
+            return samples
         }
     }
 

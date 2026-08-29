@@ -25,7 +25,7 @@ enum Glossaire {
                 // Cas « anglais (= FORME JA) » : la forme JA est dans la parenthèse.
                 if let paren = enPart.range(of: "(= ") {
                     let english = stripNote(String(enPart[..<paren.lowerBound]))
-                    let jaInside = String(enPart[paren.upperBound...]).trimmingSuffix(")")
+                    let jaInside = dropClosingParen(String(enPart[paren.upperBound...]))
                     term = HighQualityGlossaryPromptTerm(
                         id: "term-\(nextID)",
                         japanese: splitForms(jaInside),
@@ -42,11 +42,17 @@ enum Glossaire {
                     )
                 }
             } else {
-                // Ligne anglaise seule (phrase récurrente sans forme JA).
+                // Ligne anglaise seule (phrase récurrente), éventuellement
+                // avec la forme JA en note : « Freeze it! (= 凍らせろ！) ».
                 let (english, aliases) = splitEnglish(body)
+                var japanese: [String] = []
+                if let paren = body.range(of: "(= ") {
+                    let inside = dropClosingParen(String(body[paren.upperBound...]))
+                    japanese = splitForms(inside)
+                }
                 term = HighQualityGlossaryPromptTerm(
                     id: "term-\(nextID)",
-                    japanese: [],
+                    japanese: japanese,
                     english: english,
                     englishAliases: aliases
                 )
@@ -65,9 +71,9 @@ enum Glossaire {
         part.split(separator: "/")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .map { form in
-                if let open = form.firstIndex(of: " ("),
-                   let close = form.lastIndex(of: ")") {
-                    return String(form[..<open]).trimmingCharacters(in: .whitespaces)
+                if let open = form.range(of: " ("),
+                   form.lastIndex(of: ")") != nil {
+                    return String(form[..<open.lowerBound]).trimmingCharacters(in: .whitespaces)
                 }
                 return form
             }
@@ -78,27 +84,35 @@ enum Glossaire {
     /// écarte les notes « [?] (…) ».
     private static func splitEnglish(_ part: String) -> (String, [String]) {
         var cleaned = part.trimmingCharacters(in: .whitespaces)
-        if let bracket = cleaned.firstIndex(of: " [?]") {
-            cleaned = String(cleaned[..<bracket])
+        if let bracket = cleaned.range(of: " [?]") {
+            cleaned = String(cleaned[..<bracket.lowerBound])
         }
-        if let paren = cleaned.firstIndex(of: " (") {
-            cleaned = String(cleaned[..<paren])
+        if let paren = cleaned.range(of: " (") {
+            cleaned = String(cleaned[..<paren.lowerBound])
         }
         let pieces = cleaned.split(separator: "/").map {
             $0.trimmingCharacters(in: CharacterSet(charactersIn: " \t\"'«»"))
         }.filter { !$0.isEmpty }
         let main = pieces.first ?? ""
-        let aliases = pieces.dropFirst()
+        let aliases = Array(pieces.dropFirst())
         return (main, aliases)
+    }
+
+    private static func dropClosingParen(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasSuffix(")") {
+            return String(trimmed.dropLast()).trimmingCharacters(in: .whitespaces)
+        }
+        return trimmed
     }
 
     private static func stripNote(_ text: String) -> String {
         var cleaned = text.trimmingCharacters(in: .whitespaces)
-        if let bracket = cleaned.firstIndex(of: " [?]") {
-            cleaned = String(cleaned[..<bracket])
+        if let bracket = cleaned.range(of: " [?]") {
+            cleaned = String(cleaned[..<bracket.lowerBound])
         }
-        if let paren = cleaned.firstIndex(of: " (") {
-            cleaned = String(cleaned[..<paren])
+        if let paren = cleaned.range(of: " (") {
+            cleaned = String(cleaned[..<paren.lowerBound])
         }
         return cleaned.trimmingCharacters(in: .whitespaces)
     }
