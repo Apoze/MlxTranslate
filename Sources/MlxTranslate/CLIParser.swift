@@ -39,8 +39,8 @@ enum CLIParser {
             Options :
               --asr voxtral|voxtral4b|qwen3asr    backend ASR (défaut : voxtral)
               --nb N                               nombre de parlants forcé (défaut : auto)
-              --modele qwen25-7b|qwen3-8b|qwen3-14b|gemma-12b|gemma-4b
-                                                    modèle de traduction (défaut : qwen25-7b)
+              --modele qwen3-8b|qwen25-7b|qwen3-14b|gemma-12b|gemma-4b
+                                                    modèle de traduction (défaut : qwen3-8b)
               --noms 0=Hirow,1=Klin                noms des parlants (l'indice suit le
                                                     temps de parole décroissant)
               --glossaire <chemin>                  glossaire (défaut : ~/.mlxtranslate/glossaire.txt)

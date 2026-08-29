@@ -28,8 +28,9 @@ actor LocalMLXTranslator {
         case qwen3_8B = "qwen3-8b-4bit"
         case qwen3_14B = "qwen3-14b-4bit"
 
-        // Défaut : le vainqueur mesuré du pipeline python historique (Qwen2.5-7B-4bit).
-        static let productDefault = Candidate.qwen2_5_7B
+        // Défaut : qwen3-8b-4bit — vainqueur mesuré du test A/B (0 résidu CJK,
+        // traduction la plus rapide hors téléchargement, plus naturel que 7B/14B).
+        static let productDefault = Candidate.qwen3_8B
 
         var modelID: String {
             switch self {
