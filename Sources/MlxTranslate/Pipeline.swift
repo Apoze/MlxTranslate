@@ -273,7 +273,7 @@ enum Pipeline {
 
         var turns: [HighQualityTranslationTurn] = []
         for chunk in record.chunks where !chunk.text.trimmingCharacters(in: .whitespaces).isEmpty {
-            for sentence in SRT.sentences(chunk.text) {
+            for sentence in SRT.sentences(chunk.text) where SRT.containsJapanese(sentence) {
                 turns.append(HighQualityTranslationTurn(
                     id: "c\(turns.count + 1)",
                     japanese: sentence,

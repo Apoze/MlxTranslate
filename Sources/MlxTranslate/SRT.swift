@@ -96,6 +96,19 @@ enum SRT {
         return result
     }
 
+    /// Contient au moins un caractère japonais (hiragana / katakana / kanji) ?
+    /// Permet de sauter les tours non alignables (emoji « 🎵 », symboles…).
+    static func containsJapanese(_ text: String) -> Bool {
+        for scalar in text.unicodeScalars {
+            if (0x3040...0x30FF).contains(scalar.value)
+                || (0x4E00...0x9FFF).contains(scalar.value)
+            {
+                return true
+            }
+        }
+        return false
+    }
+
     // ------------------------------------------------------------------
     // Post-traitement : même algorithme que l'outil python historique.
     //   (a) fusion avec le cue suivant si gap <= 3 s et (le cue ne se
