@@ -14,6 +14,7 @@ struct Command {
     var verb: Verb
     var video: URL
     var asr: ASRBackend = .default
+    var language: String = "ja"
     var speakerCount: Int?
     var model: LocalMLXTranslator.Candidate = .productDefault
     var glossary: URL?
@@ -38,6 +39,7 @@ enum CLIParser {
 
             Options :
               --asr voxtral|voxtral4b|qwen3asr    backend ASR (défaut : voxtral)
+              --lang ja|auto                       langue forcée de l'ASR (défaut : ja)
               --nb N                               nombre de parlants forcé (défaut : auto)
               --modele qwen3-8b|qwen25-7b|qwen3-14b|gemma-12b|gemma-4b
                                                     modèle de traduction (défaut : qwen3-8b)
@@ -52,6 +54,7 @@ enum CLIParser {
         var verb: Command.Verb?
         var video: URL?
         var asr = ASRBackend.default
+        var language = "ja"
         var speakerCount: Int?
         var model = LocalMLXTranslator.Candidate.productDefault
         var glossary: URL?
@@ -72,6 +75,10 @@ enum CLIParser {
                     throw unknown("backend ASR inconnu : \(arguments[index + 1])")
                 }
                 asr = parsed
+                index += 1
+            case "--lang":
+                guard index + 1 < arguments.count else { throw unknown("--lang sans valeur") }
+                language = arguments[index + 1].lowercased()
                 index += 1
             case "--nb":
                 guard index + 1 < arguments.count, let count = Int(arguments[index + 1]) else {
@@ -113,6 +120,7 @@ enum CLIParser {
             verb: selectedVerb,
             video: selectedVideo,
             asr: asr,
+            language: language,
             speakerCount: speakerCount,
             model: model,
             glossary: glossary,

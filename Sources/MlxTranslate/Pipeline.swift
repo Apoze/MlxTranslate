@@ -222,6 +222,7 @@ enum Pipeline {
             windows: windows,
             samples: samples,
             backend: command.asr,
+            language: command.language,
             progress: { fraction, message in gate.report("asr", fraction, message) }
         )
         var records: [ChunksRecord.ChunkRecord] = []
