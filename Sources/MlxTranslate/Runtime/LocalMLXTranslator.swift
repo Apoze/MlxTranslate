@@ -355,6 +355,77 @@ actor LocalMLXTranslator {
         clearCache()
     }
 
+    // MARK: - Live (par énoncé, streaming)
+
+    /// Traduit un énoncé japonais (mode live), en streamant la traduction EN
+    /// accumulée (marqueurs retirés) via `onChunk` et en renvoyant l'anglais final.
+    /// L'énoncé est traduit seul (aucun contexte de voisin) pour éviter la
+    /// débordance de traduction observée en lot.
+    func translateLive(
+        japanese: String,
+        glossary: [HighQualityGlossaryPromptTerm],
+        sourceStart: Double? = nil,
+        sourceEnd: Double? = nil,
+        onChunk: @escaping @Sendable (String) -> Void = { _ in }
+    ) async throws -> String {
+        defer { clearCache() }
+        guard let container else {
+            throw HighQualityTranslationServiceError(
+                model: candidate.modelID,
+                attempts: [],
+                response: nil,
+                message: "\(candidate.rawValue) is not loaded."
+            )
+        }
+        let turn = HighQualityTranslationTurn(
+            id: "live",
+            japanese: japanese,
+            precedingJapanese: [],
+            followingJapanese: [],
+            speakerLabel: nil,
+            sourceStart: sourceStart,
+            sourceEnd: sourceEnd
+        )
+        var pairs: [(String, String)] = []
+        for term in glossary {
+            for japaneseForm in term.japanese {
+                pairs.append((japaneseForm, term.english))
+            }
+        }
+        var messages: [PromptMessage] = [
+            ["role": "system", "content": Self.translationSystemMessage],
+        ]
+        messages.append(qwenUserMessage(Self.formatExampleUser))
+        messages.append(["role": "assistant", "content": Self.formatExampleAssistant])
+        messages += pairs.flatMap { source, target in
+            [qwenUserMessage(source), ["role": "assistant", "content": target]]
+        }
+        messages.append(qwenUserMessage(Self.contextText(for: turn)))
+        let parameters = Self.generationParameters
+        let input = try await container.prepare(
+            input: UserInput(prompt: .messages(messages), additionalContext: ["enable_thinking": false])
+        )
+        let stream = try await container.generate(input: input, parameters: parameters)
+        var output = ""
+        for await generation in stream {
+            try Task.checkCancellation()
+            output += generation.chunk ?? ""
+            onChunk(Self.cleanLive(output))
+        }
+        let final = Self.translationText(output, for: turn, candidate: candidate)
+            ?? output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return final.isEmpty ? output.trimmingCharacters(in: .whitespacesAndNewlines) : final
+    }
+
+    /// Sortie « propre » pour l'affichage live : retire les lignes de marqueurs
+    /// et conserve l'anglais.
+    private static func cleanLive(_ raw: String) -> String {
+        let lines = raw.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !($0.hasPrefix("<<<") && $0.hasSuffix(">>>")) }
+        return lines.joined(separator: " ").trimmingCharacters(in: .whitespaces)
+    }
+
     func handleMemoryWarning() {
         clearCache()
     }

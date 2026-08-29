@@ -9,6 +9,7 @@ struct Command {
         case parlants = "parlants"
         case traduire = "traduire"
         case finale = "finale"
+        case live = "live"
     }
 
     var verb: Verb
@@ -19,6 +20,15 @@ struct Command {
     var model: LocalMLXTranslator.Candidate = .productDefault
     var glossary: URL?
     var names: String?
+    var sansParlants: Bool = false
+    // Live
+    var app: String?
+    var liveDelay: VoxtralTranscriptionDelay = .milliseconds960
+    var sansTraduction: Bool = false
+    var livePreview: Bool = true
+    var liveOutput: URL?
+    var maxSeconds: Double?
+    var listApps: Bool = false
 }
 
 enum CLIParser {
@@ -35,6 +45,7 @@ enum CLIParser {
               parlants    diarisation, écrit le RTTM et annonce les parlants
               traduire    traduction EN, écrit « <nom> (EN).srt »
               finale      chaîne complète (ASR → alignement → parlants → traduction)
+              live        sous-titres EN temps réel de l'audio d'une application (JA)
               aider       cette aide
 
             Options :
@@ -51,6 +62,18 @@ enum CLIParser {
               --noms 0=Hirow,1=Klin                noms des parlants (l'indice suit le
                                                     temps de parole décroissant)
               --glossaire <chemin>                  glossaire (défaut : ~/.mlxtranslate/glossaire.txt)
+              --sans-parlants                        finale sans diarisation (pas de noms de locuteurs)
+
+            Live (JA → EN, temps réel) :
+              live --list                             liste les applications capturables
+              live --app <bundleID|nom>                capture l'audio de l'application
+                --sans-preview                         pas de preview (traduction finale seule)
+                --sans-traduction                      JA seul (pas de traduction EN finale)
+                --modele <id>                          modèle EN final (défaut : qwen3-8b)
+                --glossaire <chemin>                   glossaire de la traduction EN
+                --delay 960|1200|2400                  latence Voxtral (défaut : 960)
+                --sortie <fichier>                     SRT live (défaut : ~/.mlxtranslate/live-<date>.srt)
+                --max N                                arrêt automatique après N secondes
             """
         }
     }
@@ -64,6 +87,14 @@ enum CLIParser {
         var model = LocalMLXTranslator.Candidate.productDefault
         var glossary: URL?
         var names: String?
+        var sansParlants = false
+        var app: String?
+        var liveDelay = VoxtralTranscriptionDelay.milliseconds960
+        var sansTraduction = false
+        var livePreview = true
+        var liveOutput: URL?
+        var maxSeconds: Double?
+        var listApps = false
 
         var index = 1
         while index < arguments.count {
@@ -71,7 +102,7 @@ enum CLIParser {
             switch argument {
             case "aider", "-h", "--help":
                 throw Help()
-            case "transcrire", "aligner", "parlants", "traduire", "finale":
+            case "transcrire", "aligner", "parlants", "traduire", "finale", "live":
                 guard verb == nil else { throw unknown("commande en double : \(argument)") }
                 verb = Command.Verb(rawValue: argument)
             case "--asr":
@@ -108,6 +139,38 @@ enum CLIParser {
                     fileURLWithPath: NSString(string: arguments[index + 1]).expandingTildeInPath as String
                 )
                 index += 1
+            case "--sans-parlants":
+                sansParlants = true
+            case "--app":
+                guard index + 1 < arguments.count else { throw unknown("--app sans valeur") }
+                app = arguments[index + 1]
+                index += 1
+            case "--list":
+                listApps = true
+            case "--delay":
+                guard index + 1 < arguments.count,
+                      let raw = Int(arguments[index + 1]),
+                      let parsed = VoxtralTranscriptionDelay(rawValue: raw) else {
+                    throw unknown("--delay doit être 960, 1200 ou 2400")
+                }
+                liveDelay = parsed
+                index += 1
+            case "--sans-traduction":
+                sansTraduction = true
+            case "--sans-preview":
+                livePreview = false
+            case "--sortie":
+                guard index + 1 < arguments.count else { throw unknown("--sortie sans valeur") }
+                liveOutput = URL(
+                    fileURLWithPath: NSString(string: arguments[index + 1]).expandingTildeInPath as String
+                )
+                index += 1
+            case "--max":
+                guard index + 1 < arguments.count, let seconds = Double(arguments[index + 1]) else {
+                    throw unknown("--max attend une durée en secondes")
+                }
+                maxSeconds = seconds
+                index += 1
             case _ where argument.hasPrefix("-"):
                 throw unknown("option inconnue : \(argument)")
             default:
@@ -118,7 +181,27 @@ enum CLIParser {
             }
             index += 1
         }
-        guard let selectedVerb = verb, let selectedVideo = video else {
+        guard let selectedVerb = verb else {
+            throw Help()
+        }
+        if selectedVerb == .live {
+            // `live` n'a pas de média positionnel : l'app vient de `--app`.
+            let videoURL = video ?? URL(fileURLWithPath: app ?? "live")
+            return Command(
+                verb: .live,
+                video: videoURL,
+                model: model,
+                glossary: glossary,
+                app: app,
+                liveDelay: liveDelay,
+                sansTraduction: sansTraduction,
+                livePreview: livePreview,
+                liveOutput: liveOutput,
+                maxSeconds: maxSeconds,
+                listApps: listApps
+            )
+        }
+        guard let selectedVideo = video else {
             throw Help()
         }
         return Command(
@@ -129,7 +212,8 @@ enum CLIParser {
             speakerCount: speakerCount,
             model: model,
             glossary: glossary,
-            names: names
+            names: names,
+            sansParlants: sansParlants
         )
     }
 

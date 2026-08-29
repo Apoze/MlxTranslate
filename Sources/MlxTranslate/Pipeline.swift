@@ -18,6 +18,7 @@ enum Pipeline {
         case diarizationFailed(String)
         case translationFailed(String)
         case emptyTranscription
+        case metalLibraryMissing
 
         var errorDescription: String? {
             switch self {
@@ -31,6 +32,10 @@ enum Pipeline {
             case .diarizationFailed(let detail): "diarisation en échec : \(detail)"
             case .translationFailed(let detail): "traduction en échec : \(detail)"
             case .emptyTranscription: "transcription vide (audio muet ?)"
+            case .metalLibraryMissing:
+                "la bibliothèque Metal MLX (mlx.metallib) est introuvable.\n"
+                + "  → Lancez d'abord une transcription (ex. `mlxtranslate transcrire <média>`) "
+                + "pour la télécharger dans ~/.mlxtranslate, puis relancez."
             }
         }
     }
@@ -148,7 +153,7 @@ enum Pipeline {
     /// Le metallib MLX (kernels Metal précompilés) n'est pas embarqué par
     /// Cmlx en SwiftPM : il doit exister à côté de l'exécutable. On le copie
     /// depuis le cache local (`~/.mlxtranslate/mlx.metallib`) s'il manque.
-    static func ensureMetalLibrary() {
+    static func ensureMetalLibrary() throws {
         guard let executableURL = Bundle.main.executableURL else { return }
         let target = executableURL.deletingLastPathComponent()
             .appendingPathComponent("mlx.metallib")
@@ -156,7 +161,7 @@ enum Pipeline {
         let source = homeURL.appendingPathComponent("mlx.metallib")
         guard FileManager.default.fileExists(atPath: source.path) else {
             log("metallib : \(source.lastPathComponent) absent du cache (\(source.path))")
-            return
+            throw PipelineError.metalLibraryMissing
         }
         do {
             try FileManager.default.copyItem(at: source, to: target)
@@ -189,12 +194,21 @@ enum Pipeline {
     // ------------------------------------------------------------------
 
     static func run(_ command: Command) async throws {
+        if command.verb == .live {
+            // Le mode live est normalement routé dans MlxTranslateMain ; repli ici.
+            if #available(macOS 26.4, *) {
+                try await Live.run(command)
+            } else {
+                throw PipelineError.mediaNotFound("le mode live nécessite macOS 26.4")
+            }
+            return
+        }
         guard FileManager.default.fileExists(atPath: command.video.path) else {
             throw PipelineError.mediaNotFound(command.video.path)
         }
         // S'assurer que le metallib MLX est à côté de l'exécutable (nécessaire
         // à l'aligner et au traducteur, qui chargent MLX Metal).
-        ensureMetalLibrary()
+        try ensureMetalLibrary()
         switch command.verb {
         case .transcrire:
             try await transcribe(command)
@@ -206,6 +220,9 @@ enum Pipeline {
             try await translate(command)
         case .finale:
             try await finale(command)
+        case .live:
+            // Inatteignable (géré ci-dessus) ; exhaustivité du switch.
+            break
         }
     }
 
@@ -361,9 +378,9 @@ enum Pipeline {
         let cues = try SRT.read(jaURL)
         guard !cues.isEmpty else { throw PipelineError.jaSRTMissing(jaURL.lastPathComponent) }
 
-        // Parlants (si noms demandés, ou si un RTTM existe pour la finale).
+        // Parlants (si noms demandés, ou si un RTTM est attendu pour la finale).
         var rttmURL: URL?
-        if command.names != nil || command.verb == .finale {
+        if command.names != nil || (command.verb == .finale && !command.sansParlants) {
             rttmURL = findRTTM(for: command.video)
             if rttmURL == nil {
                 rttmURL = try await diarize(command)
@@ -525,7 +542,9 @@ enum Pipeline {
     static func finale(_ command: Command) async throws {
         try await transcribe(command)
         try await align(command)
-        try await diarize(command)
+        if !command.sansParlants {
+            try await diarize(command)
+        }
         try await translate(command)
     }
 }

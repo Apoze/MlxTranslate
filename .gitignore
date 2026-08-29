@@ -9,3 +9,6 @@ Package.resolved
 # Exécution locale
 ~.mlxtranslate/
 *.log
+
+# Mesures (grattage)
+time_report.txt
