@@ -154,7 +154,7 @@ enum VoxtralHelperManifest {
         ) {
             return moduleResource
         }
-        let bundleName = "WhisperASR_WhisperASRApp.bundle"
+        let bundleName = "MlxTranslate_MlxTranslate.bundle"
         var roots: [URL] = []
         if let resourceURL = Bundle.main.resourceURL { roots.append(resourceURL) }
         roots.append(Bundle.main.bundleURL)
@@ -1432,7 +1432,7 @@ actor VoxtralHelperRuntime {
 
     private static func defaultRootDirectory() -> URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("WhisperASR", isDirectory: true)
+            .appendingPathComponent("MlxTranslate", isDirectory: true)
             .appendingPathComponent("Runtime", isDirectory: true)
     }
 
