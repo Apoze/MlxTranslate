@@ -38,12 +38,12 @@ enum CLIParser {
               aider       cette aide
 
             Options :
-              --asr voxtral3b|voxtral|voxtral4b|qwen3asr|qwen3asrja
+              --asr voxtral3b|voxtral|voxtral4b|qwen3asr
                      backend ASR (défaut : voxtral3b)
                      voxtral3b   = 3B forçage langue fort (offline, python)
                      voxtral     = 4B Realtime sidecar (direct/live)
                      voxtral4b   = 4B Realtime natif Swift
-                     qwen3asr    = Qwen3-ASR 0,6B / qwen3asrja = 1,7B-JA
+                     qwen3asr    = Qwen3-ASR 0,6B (test)
               --lang ja|auto                       langue forcée de l'ASR (défaut : ja)
               --nb N                               nombre de parlants forcé (défaut : auto)
               --modele qwen3-8b|qwen25-7b|qwen3-14b|gemma-12b|gemma-4b

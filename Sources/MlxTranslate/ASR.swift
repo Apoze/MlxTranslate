@@ -8,7 +8,6 @@ import HuggingFace
 //               par-fenêtre avec deltas) ;
 //   voxtral4b — même modèle, natif Swift (fp16), sans python ;
 //   qwen3asr  — Qwen3-ASR 0,6B 4-bit (mlx-community), test qualité ;
-//   qwen3asrja— Qwen3-ASR 1,7B-JA (spécialisé japonais) ;
 //   voxtral3b — Voxtral Mini 3B (mzbac) via script python (mlx_voxtral),
 //               forçage de langue fort (prompt lang:ja) ; ASR offline par
 //               défaut pour la traduction de vidéos.
@@ -17,7 +16,6 @@ enum ASRBackend: String, CaseIterable, Sendable {
     case voxtral = "voxtral"
     case voxtral4b = "voxtral4b"
     case qwen3asr = "qwen3asr"
-    case qwen3asrja = "qwen3asrja"
     case voxtral3b = "voxtral3b"
 
     static let `default` = ASRBackend.voxtral3b
@@ -27,7 +25,6 @@ enum ASRBackend: String, CaseIterable, Sendable {
         case .voxtral: "Voxtral 4B Realtime (sidecar, direct)"
         case .voxtral4b: "Voxtral 4B Realtime fp16 (Swift)"
         case .qwen3asr: "Qwen3-ASR 0,6B (Swift)"
-        case .qwen3asrja: "Qwen3-ASR 1,7B-JA (Swift, spécialisé japonais)"
         case .voxtral3b: "Voxtral Mini 3B (python, forçage langue fort)"
         }
     }
@@ -75,11 +72,6 @@ enum ASR {
         case .qwen3asr:
             return try await transcribeQwen3ASR(
                 windows: windows, modelID: "mlx-community/Qwen3-ASR-0.6B-4bit",
-                language: language, progress: progress
-            )
-        case .qwen3asrja:
-            return try await transcribeQwen3ASR(
-                windows: windows, modelID: "ph0ryn/Qwen3-ASR-1.7B-JA-MLX-8bit",
                 language: language, progress: progress
             )
         case .voxtral3b:
@@ -261,7 +253,7 @@ enum ASR {
         progress(0.05, "Chargement \(modelID)…")
         let model = try await Qwen3ASRModel.fromPretrained(modelID)
         progress(0.3, "Modèle ASR prêt")
-        let backend = modelID.contains("1.7B") ? ASRBackend.qwen3asrja : ASRBackend.qwen3asr
+        let backend = ASRBackend.qwen3asr
         var chunkTexts: [String] = []
         for (index, window) in windows.enumerated() {
             let parameters = STTGenerateParameters(
