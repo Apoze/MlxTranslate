@@ -74,39 +74,34 @@ enum ASR {
         try await helper.prepare { fraction, message in
             progress(fraction * 0.3, "Voxtral sidecar — \(message)")
         }
-        let stream = try await helper.startSession()
+        let windowCount = windows.count
         var chunkTexts: [String] = []
-        var windowIndex = 0
-        for window in windows {
-            windowIndex += 1
-            try await helper.append(samples: Array(window.samples), range: (Int(window.start * 16_000))..<(Int(window.end * 16_000)))
-            var windowText = ""
-            for await event in stream {
-                switch event {
-                case .delta(let text, _):
-                    windowText += text
-                case .acknowledged(let through):
-                    if through >= Int(window.end * 16_000) {
-                        chunkTexts.append(windowText)
-                        progress(
-                            0.3 + Double(windowIndex - 1) / Double(max(windows.count, 1)) * 0.6,
-                            "fenêtre \(windowIndex)/\(windows.count)"
-                        )
-                        break
-                    }
-                case .completed(let transcript, _):
-                    chunkTexts.append(transcript)
-                    progress(0.9, "fenêtre \(windowIndex)/\(windows.count)")
-                    break
-                case .failed(let message):
-                    throw Pipeline.PipelineError.transcriptionFailed(message)
-                case .ready, .emissionMarker:
-                    continue
-                }
+        // Offline par fenêtre : chaque fenêtre est transcrite dans une session
+        // dédiée puis mise à jour (commit/flush). Le commit résout le décalage
+        // du modèle streaming : le texte de la fenêtre K est la transcription
+        // complète de son propre audio (et non un fragment décalé).
+        for (index, window) in windows.enumerated() {
+            let windowSamples = Array(window.samples)
+            var chunkText = ""
+            do {
+                _ = try await helper.startSession()
+                try await helper.append(
+                    samples: windowSamples,
+                    range: 0..<windowSamples.count
+                )
+                chunkText = try await helper.stopAndFlush()
+            } catch {
+                Pipeline.log("fenêtre Voxtral \(index + 1) en échec : \(error.localizedDescription)")
+                await helper.cancel()
             }
+            chunkTexts.append(chunkText.trimmingCharacters(in: .whitespacesAndNewlines))
+            progress(
+                0.3 + Double(index + 1) / Double(max(windowCount, 1)) * 0.6,
+                "fenêtre \(index + 1)/\(windowCount)"
+            )
         }
-        let fullText = try await helper.stopAndFlush()
         await helper.shutdown()
+        let fullText = chunkTexts.joined(separator: " ")
         return ASRResult(
             backend: .voxtral,
             chunkTexts: chunkTexts,

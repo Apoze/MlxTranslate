@@ -166,6 +166,31 @@ enum SRT {
         return finalCues
     }
 
+    /// Reconstruit le texte d'une cue à partir des items caractère-à-caractère
+    /// de l'aligneur, en insérant «。» aux vraies pauses (≥0,8 s) — l'ASR
+    /// sort un texte sans ponctuation. Le point-virgule «、» est évité car
+    /// les items sont au niveau caractère : un «、» tomberait au milieu d'un
+    /// mot. Seules les longues silences (≥0,8 s) marquent une fin de phrase.
+    static func punctuatedText(
+        items: [HighQualityAlignmentItem],
+        fallback: String
+    ) -> String {
+        guard !items.isEmpty else { return fallback }
+        let sorted = items.sorted { $0.start < $1.start }
+        var text = sorted[0].text
+        var previousEnd = sorted[0].end
+        for item in sorted.dropFirst() {
+            let gap = item.start - previousEnd
+            if gap >= 0.8 {
+                text += "。" + item.text
+            } else {
+                text += item.text
+            }
+            previousEnd = item.end
+        }
+        return text.trimmingCharacters(in: .whitespaces)
+    }
+
     private static func splitOnce(_ cs: Double, _ ce: Double, _ text: String) -> [(Double, Double, String)] {
         let duration = ce - cs
         if duration <= 12.0 || text.count < 4 {
@@ -174,19 +199,26 @@ enum SRT {
         let candidates = text.indices.filter { sentenceEnders.contains(text[$0]) }
         let middle = text.count / 2
         let splitPoint: Int
-        if let nearest = candidates.min(by: { abs(text.distance(from: $0, to: text.startIndex) - middle) < abs(text.distance(from: $1, to: text.startIndex) - middle) }) {
+        // On ne coupe que sur un point final « utilisable » (entre 20 % et 80 %
+        // du texte). Sinon (Voxtral 4B sort du texte sans 「。」) on retombe sur
+        // le point médian : un point final isolé en bout de phrase ne doit pas
+        // empêcher de couper une longue cue.
+        let usable = candidates.filter { index in
+            let pos = text.distance(from: text.startIndex, to: index) + 1
+            return pos > text.count / 5 && pos < text.count * 4 / 5
+        }
+        if let nearest = usable.min(by: { abs(text.distance(from: $0, to: text.startIndex) - middle) < abs(text.distance(from: $1, to: text.startIndex) - middle) }) {
             var point = text.distance(from: text.startIndex, to: nearest) + 1
             var index = text.index(text.startIndex, offsetBy: point)
             while index < text.endIndex, sentenceEnders.contains(text[index]) {
                 point += 1
                 index = text.index(after: index)
             }
-            if point <= 0 || point >= text.count { return [(cs, ce, text)] }
-            splitPoint = point
+            if point <= 0 || point >= text.count { splitPoint = middle + 1 } else { splitPoint = point }
         } else {
             splitPoint = middle + 1
-            if splitPoint <= 0 || splitPoint >= text.count { return [(cs, ce, text)] }
         }
+        if splitPoint <= 0 || splitPoint >= text.count { return [(cs, ce, text)] }
         let t1 = cs + duration * (Double(splitPoint) / Double(text.count))
         let first = text.prefix(splitPoint).trimmingCharacters(in: .whitespaces)
         let second = text.dropFirst(splitPoint).trimmingCharacters(in: .whitespaces)

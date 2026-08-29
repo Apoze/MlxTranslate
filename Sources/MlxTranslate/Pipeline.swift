@@ -145,6 +145,27 @@ enum Pipeline {
         FileHandle.standardError.write(Data((line + "\n").utf8))
     }
 
+    /// Le metallib MLX (kernels Metal précompilés) n'est pas embarqué par
+    /// Cmlx en SwiftPM : il doit exister à côté de l'exécutable. On le copie
+    /// depuis le cache local (`~/.mlxtranslate/mlx.metallib`) s'il manque.
+    static func ensureMetalLibrary() {
+        guard let executableURL = Bundle.main.executableURL else { return }
+        let target = executableURL.deletingLastPathComponent()
+            .appendingPathComponent("mlx.metallib")
+        if FileManager.default.fileExists(atPath: target.path) { return }
+        let source = homeURL.appendingPathComponent("mlx.metallib")
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            log("metallib : \(source.lastPathComponent) absent du cache (\(source.path))")
+            return
+        }
+        do {
+            try FileManager.default.copyItem(at: source, to: target)
+            log("metallib : copié à côté de l'exécutable")
+        } catch {
+            log("metallib : copie ignorée (\(error.localizedDescription))")
+        }
+    }
+
     // ------------------------------------------------------------------
     // Progression
     // ------------------------------------------------------------------
@@ -171,6 +192,9 @@ enum Pipeline {
         guard FileManager.default.fileExists(atPath: command.video.path) else {
             throw PipelineError.mediaNotFound(command.video.path)
         }
+        // S'assurer que le metallib MLX est à côté de l'exécutable (nécessaire
+        // à l'aligner et au traducteur, qui chargent MLX Metal).
+        ensureMetalLibrary()
         switch command.verb {
         case .transcrire:
             try await transcribe(command)
@@ -267,8 +291,11 @@ enum Pipeline {
 
         var rawCues: [(start: Double, end: Double, text: String)] = []
         for chunk in exchange.chunks {
+            let itemsByCue = Dictionary(grouping: chunk.rawItems, by: \.cueID)
             for cue in chunk.cues where !cue.text.trimmingCharacters(in: .whitespaces).isEmpty {
-                rawCues.append((cue.start, cue.end, cue.text))
+                let items = (itemsByCue[cue.id] ?? []).sorted { $0.start < $1.start }
+                let text = SRT.punctuatedText(items: items, fallback: cue.text)
+                rawCues.append((cue.start, cue.end, text))
             }
         }
         let finalCues = SRT.postProcess(rawCues)
@@ -395,7 +422,9 @@ enum Pipeline {
 
         // Résidus CJK → nouvelle tentative sans glossaire, sinon texte JA.
         var english = cues.map { cue in
-            byID["t\(cue.index)"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? cue.text
+            let translated = byID["t\(cue.index)"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return (translated?.isEmpty == false) ? translated! : cue.text
         }
         var residualPositions = cues.indices.filter { position in
             english[position] != cues[position].text && Self.containsCJK(english[position])

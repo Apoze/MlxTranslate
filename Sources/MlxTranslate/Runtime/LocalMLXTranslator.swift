@@ -103,11 +103,38 @@ actor LocalMLXTranslator {
     static let runtimeVersion = "3.31.4"
     static let declaredPeakMemoryBytes = Candidate.productDefault.declaredPeakMemoryBytes
     static let inputTokenLimit = 2_048
-    static let generationParameters = GenerateParameters(maxTokens: 256, temperature: 0)
+    static let generationParameters = GenerateParameters(
+        maxTokens: 256,
+        temperature: 0,
+        repetitionPenalty: 1.2,
+        repetitionContextSize: 50
+    )
     static let retryGenerationParameters = GenerateParameters(
         maxTokens: 128,
-        temperature: 0
+        temperature: 0,
+        repetitionPenalty: 1.2,
+        repetitionContextSize: 50
     )
+    static let translationSystemMessage = """
+    You are a Japanese-to-English subtitle translation engine.
+    Translate the given Japanese subtitle line into natural, concise English suitable for subtitles.
+    Reply with ONLY the English translation, placed between the same two CURRENT markers that surround the Japanese.
+    No explanations, no preambles, no Japanese, no extra text.
+    """
+    // Exemple de format : montre au modèle la structure exacte à respecter
+    // (contexte → seule la ligne entre les marqueurs est traduite).
+    static let formatExampleUser = """
+    きのう の あめ は つよかったよ
+    <<<CURRENT:example>>>
+    きょう は あめ が やんで そら が きれい
+    <<<END_CURRENT:example>>>
+    あした も あめ が ふりそうだから てるさを もっていってね
+    """
+    static let formatExampleAssistant = """
+    <<<CURRENT:example>>>
+    The rain stopped today and the sky is clear
+    <<<END_CURRENT:example>>>
+    """
 
     let candidate: Candidate
     private var container: ModelContainer?
@@ -251,34 +278,30 @@ actor LocalMLXTranslator {
                 }
                 try Task.checkCancellation()
                 let nativeOutput = output
-                guard let output = Self.translationText(
+                if let output = Self.translationText(
                     nativeOutput,
                     for: turn,
                     candidate: candidate
-                ), !output.isEmpty else {
-                    throw HighQualityTranslationServiceError(
+                ), !output.isEmpty {
+                    translations.append(.init(id: turn.id, source: turn.japanese, text: output))
+                    traces.append(.init(
+                        cueIDs: [turn.id],
+                        sanitizedPrompt: prompt,
+                        nativePrompt: nativePrompt,
+                        nativeOutput: nativeOutput,
                         model: candidate.modelID,
-                        attempts: [],
-                        response: nil,
-                        message: "\(candidate.rawValue) returned an empty translation for \(turn.id)."
-                    )
+                        revision: candidate.revision,
+                        sanitizedOutput: output,
+                        inputTokens: tokenCount,
+                        outputTokens: outputTokens,
+                        finishReason: finishReason,
+                        duration: Date().timeIntervalSince(unitStarted),
+                        context: batch.context(for: turn)
+                    ))
+                    inFlightTrace = nil
                 }
-                translations.append(.init(id: turn.id, source: turn.japanese, text: output))
-                traces.append(.init(
-                    cueIDs: [turn.id],
-                    sanitizedPrompt: prompt,
-                    nativePrompt: nativePrompt,
-                    nativeOutput: nativeOutput,
-                    model: candidate.modelID,
-                    revision: candidate.revision,
-                    sanitizedOutput: output,
-                    inputTokens: tokenCount,
-                    outputTokens: outputTokens,
-                    finishReason: finishReason,
-                    duration: Date().timeIntervalSince(unitStarted),
-                    context: batch.context(for: turn)
-                ))
-                inFlightTrace = nil
+                // Traduction vide → on saute ce cue : le pipeline conserve le
+                // texte japonais pour les cues qui n'ont pas de traduction.
             }
 
             let response = String(decoding: try JSONEncoder().encode(
@@ -356,20 +379,22 @@ actor LocalMLXTranslator {
                 pairs.append((japanese, term.english))
             }
         }
-        var messages = pairs.flatMap { source, target in
+        var messages: [PromptMessage] = [
+            ["role": "system", "content": Self.translationSystemMessage],
+        ]
+        // Exemple de format : le modèle doit traduire uniquement la ligne
+        // entre les marqueurs, et répondre avec les marqueurs + l'anglais.
+        messages.append(qwenUserMessage(Self.formatExampleUser))
+        messages.append(["role": "assistant", "content": Self.formatExampleAssistant])
+        messages += pairs.flatMap { source, target in
             [qwenUserMessage(source), ["role": "assistant", "content": target]]
         }
-        messages.append(qwenUserMessage(Self.contextText(for: turn), currentCue: true))
+        messages.append(qwenUserMessage(Self.contextText(for: turn)))
         return messages
     }
 
-    private func qwenUserMessage(_ text: String, currentCue: Bool = false) -> PromptMessage {
-        [
-            "role": "user",
-            "content": currentCue
-                ? "Use the surrounding Japanese only as context. Translate only the text between the CURRENT markers. Return those exact markers around the English translation, without explanations:\n\n\(text)"
-                : text,
-        ]
+    private func qwenUserMessage(_ text: String) -> PromptMessage {
+        ["role": "user", "content": text]
     }
 
     static func directNativePrompt(for japanese: String) throws -> String {
@@ -443,19 +468,11 @@ actor LocalMLXTranslator {
     }
 
     private static func contextText(for turn: HighQualityTranslationTurn) -> String {
-        let start = "<<<CURRENT:\(turn.id)>>>"
-        let end = "<<<END_CURRENT:\(turn.id)>>>"
-        return """
-        SPEAKER_ID:
-        \(turn.speakerLabel ?? "")
-        CONTEXT_BEFORE:
-        \(turn.precedingJapanese.joined(separator: "\n"))
-        \(start)
-        \(turn.japanese)
-        \(end)
-        CONTEXT_AFTER:
-        \(turn.followingJapanese.joined(separator: "\n"))
-        """
+        var lines: [String] = []
+        lines.append(contentsOf: turn.precedingJapanese)
+        lines.append("<<<CURRENT:\(turn.id)>>>\n\(turn.japanese)\n<<<END_CURRENT:\(turn.id)>>>")
+        lines.append(contentsOf: turn.followingJapanese)
+        return lines.joined(separator: "\n")
     }
 
     static func translationText(
@@ -468,12 +485,53 @@ actor LocalMLXTranslator {
         }
         let start = "<<<CURRENT:\(turn.id)>>>"
         let end = "<<<END_CURRENT:\(turn.id)>>>"
-        guard let startRange = output.range(of: start),
-              let endRange = output.range(of: end, range: startRange.upperBound..<output.endIndex) else {
-            return nil
+        var result: String
+        // 1) Marqueur de début présent : on prend ce qui suit (entre les
+        //    marqueurs si l'end est là, sinon jusqu'à la fin).
+        if let startRange = output.range(of: start) {
+            if let endRange = output.range(of: end, range: startRange.upperBound..<output.endIndex) {
+                result = String(output[startRange.upperBound..<endRange.lowerBound])
+            } else {
+                result = String(output[startRange.upperBound...])
+            }
+        } else {
+            // 2) Pas de marqueur de début : on retire le préambule éventuel
+            //    (« Here is the translation… »), puis on prend la traduction.
+            var lines = output.components(separatedBy: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            if let first = lines.first {
+                let lowered = first.lowercased()
+                let looksLikePreamble = lowered.hasSuffix(":")
+                    || lowered.contains("here is")
+                    || lowered.contains("translation")
+                if lines.count > 1 && looksLikePreamble {
+                    lines = Array(lines.dropFirst())
+                }
+            }
+            result = lines.joined(separator: " ")
         }
-        return output[startRange.upperBound..<endRange.lowerBound]
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Nettoyage : guillemets + marqueurs résiduels.
+        var text = Self.stripQuotes(result)
+        text = text.replacingOccurrences(of: "<<<CURRENT:\(turn.id)>>>", with: " ")
+        text = text.replacingOccurrences(of: "<<<END_CURRENT:\(turn.id)>>>", with: " ")
+        text = text.replacingOccurrences(
+            of: "(?:<<<(?:END_)?CURRENT:[a-zA-Z0-9_]+>>>)",
+            with: " ",
+            options: .regularExpression
+        )
+        text = text.components(separatedBy: " ").filter { !$0.isEmpty }.joined(separator: " ")
+        return text.isEmpty ? nil : text
+    }
+
+    /// Retire les guillemets que le modèle entoure parfois autour de la
+    /// traduction, ainsi que les espaces résiduels.
+    private static func stripQuotes(_ s: String) -> String {
+        var text = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.count >= 2, text.hasPrefix("\""), text.hasSuffix("\"") {
+            text = String(text.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+        }
+        return text
     }
 
     private static func nativePrompt(_ messages: [PromptMessage]) throws -> String {

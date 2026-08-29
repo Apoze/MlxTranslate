@@ -19,6 +19,20 @@ enum AudioError: LocalizedError {
 enum Audio {
     static let sampleRate = 16_000
 
+    // Lectures little-endian indépendantes de l'alignement du pointeur
+    // (assemblage byte par byte — pas de `load(as:)` qui piège si le
+    // pointeur n'est pas naturellement aligné).
+    static func le16(_ data: Data, _ offset: Int) -> UInt16 {
+        UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
+    }
+
+    static func le32(_ data: Data, _ offset: Int) -> UInt32 {
+        UInt32(data[offset])
+            | (UInt32(data[offset + 1]) << 8)
+            | (UInt32(data[offset + 2]) << 16)
+            | (UInt32(data[offset + 3]) << 24)
+    }
+
     /// Extrait l'audio d'un média vidéo vers `dest` (16 kHz mono WAV).
     static func extractWav(video: URL, to dest: URL) throws {
         var stderrData = Data()
@@ -67,38 +81,16 @@ enum Audio {
         var dataLength = 0
         while offset + 8 <= data.count {
             let chunkID = String(decoding: data[offset..<offset + 4], as: UTF8.self)
-            let chunkSize = Int(
-                UInt32(
-                    littleEndian: data[(offset + 4)..<(offset + 8)].withUnsafeBytes {
-                        $0.load(as: UInt32.self)
-                    }
-                )
-            )
+            let chunkSize = Int(le32(data, offset + 4))
             let payloadStart = offset + 8
             guard payloadStart + min(chunkSize, data.count - payloadStart) <= data.count else { break }
             switch chunkID {
             case "fmt ":
                 guard payloadStart + 16 <= data.count else { break }
-                formatCode = UInt16(
-                    littleEndian: data[payloadStart...(payloadStart + 1)].withUnsafeBytes {
-                        $0.load(as: UInt16.self)
-                    }
-                )
-                channels = UInt16(
-                    littleEndian: data[(payloadStart + 2)..<(payloadStart + 4)].withUnsafeBytes {
-                        $0.load(as: UInt16.self)
-                    }
-                )
-                sampleRateHz = UInt32(
-                    littleEndian: data[(payloadStart + 4)..<(payloadStart + 8)].withUnsafeBytes {
-                        $0.load(as: UInt32.self)
-                    }
-                )
-                bitsPerSample = UInt16(
-                    littleEndian: data[(payloadStart + 14)..<(payloadStart + 16)].withUnsafeBytes {
-                        $0.load(as: UInt16.self)
-                    }
-                )
+                formatCode = le16(data, payloadStart)
+                channels = le16(data, payloadStart + 2)
+                sampleRateHz = le32(data, payloadStart + 4)
+                bitsPerSample = le16(data, payloadStart + 14)
             case "data":
                 dataStart = payloadStart
                 dataLength = chunkSize
@@ -136,7 +128,9 @@ enum Audio {
             let count = buffer.count / 2
             var samples = [Float](repeating: 0, count: count)
             for i in 0..<count {
-                let value = Int16(bitPattern: buffer.load(fromByteOffset: i * 2, as: UInt16.self))
+                let lo = UInt16(buffer[i * 2])
+                let hi = UInt16(buffer[i * 2 + 1])
+                let value = Int16(bitPattern: lo | (hi << 8))
                 samples[i] = Float(value) / 32_768
             }
             return samples
@@ -148,7 +142,12 @@ enum Audio {
             let count = buffer.count / 4
             var samples = [Float](repeating: 0, count: count)
             for i in 0..<count {
-                samples[i] = Float(bitPattern: buffer.load(fromByteOffset: i * 4, as: UInt32.self))
+                let b0 = UInt32(buffer[i * 4])
+                let b1 = UInt32(buffer[i * 4 + 1])
+                let b2 = UInt32(buffer[i * 4 + 2])
+                let b3 = UInt32(buffer[i * 4 + 3])
+                let bits = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+                samples[i] = Float(bitPattern: bits)
             }
             return samples
         }
@@ -159,7 +158,12 @@ enum Audio {
             let count = buffer.count / 4
             var samples = [Float](repeating: 0, count: count)
             for i in 0..<count {
-                let value = Int32(bitPattern: buffer.load(fromByteOffset: i * 4, as: UInt32.self))
+                let b0 = UInt32(buffer[i * 4])
+                let b1 = UInt32(buffer[i * 4 + 1])
+                let b2 = UInt32(buffer[i * 4 + 2])
+                let b3 = UInt32(buffer[i * 4 + 3])
+                let bits = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+                let value = Int32(bitPattern: bits)
                 samples[i] = Float(value) / 2_147_483_648
             }
             return samples
