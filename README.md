@@ -150,9 +150,40 @@ Les SRT offline sont écrits **côte à côte de la vidéo** :
 ## Construction
 
 ```
-swift build          # produit .build/debug/mlxtranslate
+swift build          # produit .build/debug/mlxtranslate (CLI)
 swift run mlxtranslate aider
+./make-app.sh        # construit build/MlxTranslate.app (GUI) et le signe ad-hoc
 ```
 
 MacBook avec Apple Silicon, macOS 15+ (offline) / macOS 26.4+ (live),
 toolchain Swift 6.3.
+
+## GUI (macOS)
+
+Une app native (SwiftUI) repose sur la même librairie `MlxTranslate`. Elle est
+produite par `./make-app.sh` en `build/MlxTranslate.app` (bundle avec
+`CFBundleIdentifier com.apoze.mlxtranslate`, signé ad-hoc).
+
+```
+./make-app.sh            # build + bundle .app (debug)
+./make-app.sh release    # build release
+open build/MlxTranslate.app
+```
+
+- **Onglet Offline** : on dépose une vidéo (`.mp4`, `.mov`, …) ; « Traduire (EN) »
+  + choix du modèle de traduction ; **Lancer** enchaîne ASR → alignement → parlants
+  → traduction EN (le SRT `(EN)` est écrit côte à côte de la vidéo). Sans
+  « Traduire », la chaîne s'arrête aux sous-titres JA.
+- **Onglet Live** : choix de l'application à capturer, du modèle de traduction et
+  de la latence Voxtral ; **Démarrer/Arrêter** capture l'audio de l'application,
+  alimente la superposition et écrit le SRT live dans `~/.mlxtranslate`.
+- **Superposition** : une barre de sous-titres **transparente, flottante et
+  déplaçable** (fenêtre séparée de l'app) affiche l'EN en cours (preview
+  atténuée → final en blanc), style « sous-titres YouTube ». Sa position est
+  mémorisée. Menu **Superposition** (de l'app) pour l'afficher/masquer.
+- **Barre des menus** : une icône (bulle de sous-titres) permet de démarrer/arrêter
+  le live, afficher la superposition, ouvrir la fenêtre, sans ouvrir l'app.
+
+La capture live passe par ScreenCaptureKit : l'accord « Enregistrement de
+l'écran » s'accorde **à l'app** (`com.apoze.mlxtranslate`), pas au terminal —
+voir `docs/tcc.md`.

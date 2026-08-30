@@ -15,6 +15,7 @@ let package = Package(
     products: [
         .executable(name: "mlxtranslate", targets: ["MlxTranslateCLI"]),
         .executable(name: "mlxtranslatetests", targets: ["MlxTranslateTests"]),
+        .executable(name: "mlxtranslateapp", targets: ["MlxTranslateApp"]),
     ],
     traits: [
         // Génère le bundle de ressources (Bundle.module) pour la cible.
@@ -72,6 +73,14 @@ let package = Package(
             name: "MlxTranslateTests",
             dependencies: ["MlxTranslate"],
             path: "Tests/MlxTranslateTests"
+        ),
+        // App GUI (SwiftUI) : une fine couche sur la librairie. Fenêtre principale
+        // (onglets Offline / Live) + superposition de sous-titres flottante (NSPanel).
+        // Produit en .app via `make-app.sh` (bundle .app + Info.plist, TCC stable).
+        .executableTarget(
+            name: "MlxTranslateApp",
+            dependencies: ["MlxTranslate"],
+            path: "Sources/MlxTranslateApp"
         ),
     ],
     swiftLanguageModes: [.v5],

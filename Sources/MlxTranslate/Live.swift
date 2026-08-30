@@ -193,6 +193,13 @@ struct LiveEngineConfiguration: Sendable {
     var outputURL: URL
     var maxSeconds: Double?
     var show: Bool = true
+    // Callback de superposition : le texte EN courant (preview en streaming, puis final
+    // engagé) + un flag « estFinal ». Sert à alimenter une barre de sous-titres GUI
+    // (l'outil CLI renvoie nil → pas de superposition).
+    var onLine: (@Sendable (String, Bool) -> Void)?
+    // Signal d'arrêt externe (GUI « Arrêter ») : la boucle s'arrête quand il renvoie true
+    // (en plus de SIGINT / --max / échec du flux SCK).
+    var stopRequested: @Sendable () -> Bool = { false }
 }
 
 enum LiveError: LocalizedError {
@@ -269,6 +276,9 @@ struct LiveEngine: Sendable {
     @available(macOS 26.4, *)
     func run() async throws {
         Pipeline.log("mode live : capture de « \(configuration.app) »")
+        // Garanti le metallib MLX (kernels Metal) à côté de l'exécutable, même quand
+        // on appelle LiveEngine directement (GUI) plutôt que via Live.run (CLI).
+        try Pipeline.ensureMetalLibrary()
         let apps = try await AppCapture.listApps()
         guard let match = apps.first(where: {
             $0.id.caseInsensitiveCompare(configuration.app) == .orderedSame
@@ -353,7 +363,7 @@ struct LiveEngine: Sendable {
 
         while !stopRequested {
             try? await Task.sleep(for: .seconds(LiveEndpointing.pollSeconds))
-            if stopLock.withLock({ $0 }) { stopRequested = true; break }
+            if stopLock.withLock({ $0 }) || configuration.stopRequested() { stopRequested = true; break }
 
             let available = capture.sampleCount()
             guard available >= LiveEndpointing.minSilenceFrames * LiveEndpointing.frameSamples else { continue }
@@ -389,6 +399,7 @@ struct LiveEngine: Sendable {
                         sourceEnd: endSeconds,
                         onChunk: { chunk in
                             if !chunk.isEmpty {
+                                configuration.onLine?(chunk, false)
                                 Task {
                                     await output.showPreview("\(LiveFormat.timecode(startSeconds)) ~ \(chunk)")
                                 }
@@ -409,6 +420,9 @@ struct LiveEngine: Sendable {
                 english: enText,
                 show: configuration.show
             )
+            // Superposition : engagement du final EN (ou JA si sans-traduction).
+            let finalEN = enText ?? (configuration.sansTraduction ? jaText : "")
+            if !finalEN.isEmpty { configuration.onLine?(finalEN, true) }
 
             lastCommit = cut
             previewTask?.committedSampleOffset = lastCommit
@@ -440,6 +454,8 @@ struct LiveEngine: Sendable {
                 english: enText,
                 show: configuration.show
             )
+            let finalEN = enText ?? (configuration.sansTraduction ? jaText : "")
+            if !finalEN.isEmpty { configuration.onLine?(finalEN, true) }
         }
 
         // --- Arrêt propre ----------------------------------------------------
