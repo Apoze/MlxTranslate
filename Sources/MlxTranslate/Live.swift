@@ -144,6 +144,14 @@ final class LivePreviewTask: @unchecked Sendable {
     private let stopLock = OSAllocatedUnfairLock(initialState: false)
     private let jaLock = NSLock()
     private var rollingJA = ""
+    /// Borne (échantillons 16 kHz, index absolu) jusqu'où le transcribeur Apple
+    /// a FINALISÉ des résultats (`resultsFinalizationTime`) : le texte avant
+    /// cette borne ne changera plus. Signal d'endpointing complémentaire
+    /// (stabilité dure) — lu depuis le moteur via `finalizedThroughSample`.
+    private var finalizedThroughSampleLocked = 0
+    /// Formes JA du glossaire, injectées comme « context strings » du
+    /// transcribeur Apple (bias lexical des termes propres).
+    private let contextualStrings: [String]
     /// Début (échantillons 16 kHz) de l'énoncé en cours — mis à jour par le
     /// moteur live après chaque commit ; sert d'horodatage aux previews.
     var committedSampleOffset = 0
@@ -156,19 +164,21 @@ final class LivePreviewTask: @unchecked Sendable {
         speech: AppleSpeechService,
         translation: AppleTranslationService,
         output: LiveOutput,
+        contextualStrings: [String] = [],
         previewLine: (@Sendable (String, Bool) -> Void)? = nil
     ) {
         self.capture = capture
         self.speech = speech
         self.translation = translation
         self.output = output
+        self.contextualStrings = contextualStrings
         self.previewLine = previewLine
     }
 
     @MainActor
     func start() async throws {
         try await speech.prepare(localeIdentifier: "ja")
-        try await speech.start(localeIdentifier: "ja") { [weak self] update in
+        try await speech.start(localeIdentifier: "ja", contextualStrings: contextualStrings) { [weak self] update in
             self?.handleUpdate(update)
         }
         task = Task { @MainActor [weak self] in
@@ -226,7 +236,16 @@ final class LivePreviewTask: @unchecked Sendable {
         let text = update.segment.text
         jaLock.lock()
         if !text.isEmpty { rollingJA = text }
+        if update.finalizedThroughSample > finalizedThroughSampleLocked {
+            finalizedThroughSampleLocked = update.finalizedThroughSample
+        }
         jaLock.unlock()
+    }
+
+    /// Borne de finalisation Apple (échantillons 16 kHz, index absolu) — le
+    /// texte avant cette borne est définitif (signal d'endpointing).
+    var finalizedThroughSample: Int {
+        jaLock.withLock { finalizedThroughSampleLocked }
     }
 
     func finish() async {
@@ -255,6 +274,11 @@ struct LiveEngineConfiguration: Sendable {
     /// Niveau final ASR : `qwenJA` (défaut produit, endpointing sémantique
     /// Qwen3-ASR + aligneur) ou `voxtralQ4` (legacy).
     var liveASR: LiveFinalASR = LiveFinalASR.productDefault
+    /// Pseudo-live Qwen : snapshots cumulatifs de la clause en cours (cadence
+    /// 2 s) pilotés par `QwenPseudoLiveCoordinator` — ligne roulante de la
+    /// sortie du modèle final + aliment de l'endpointing sémantique. ON par
+    /// défaut en mode qwenja ; `MLXTRANSLATE_PSEUDO_LIVE=0` le désactive.
+    var pseudoLive: Bool = true
     // Callback de superposition : le texte EN courant (preview en streaming, puis final
     // engagé) + un flag « estFinal ». Sert à alimenter une barre de sous-titres GUI
     // (l'outil CLI renvoie nil → pas de superposition).
@@ -319,7 +343,8 @@ enum Live {
             sansTraduction: command.sansTraduction,
             outputURL: outputURL,
             maxSeconds: command.maxSeconds,
-            liveASR: command.liveASR
+            liveASR: command.liveASR,
+            pseudoLive: ProcessInfo.processInfo.environment["MLXTRANSLATE_PSEUDO_LIVE"] != "0"
         )
         try await LiveEngine(configuration: config).run()
     }
@@ -392,6 +417,18 @@ struct LiveEngine: Sendable {
         var previewTask: LivePreviewTask?
         let speech = AppleSpeechService()
         let translation = AppleTranslationService()
+        // Glossaire : chargé AVANT le preview pour injecter les formes JA comme
+        // « context strings » du transcribeur Apple (bias lexical des termes
+        // propres) ; il alimente aussi la traduction (prompt + contexte roulant).
+        var glossary: [HighQualityGlossaryPromptTerm] = []
+        if let glossaryURL = configuration.glossaryURL {
+            glossary = (try? Glossaire.terms(from: glossaryURL)) ?? []
+        }
+        if !glossary.isEmpty { Pipeline.log("glossaire : \(glossary.count) terme(s)") }
+        let contextualStrings = Glossaire.contextualStrings(terms: glossary)
+        if !contextualStrings.isEmpty {
+            Pipeline.log("context strings : \(contextualStrings.count) forme(s) JA")
+        }
         if configuration.preview {
             do {
                 try await translation.configure(sourceLocale: "ja")
@@ -400,6 +437,7 @@ struct LiveEngine: Sendable {
             }
             previewTask = LivePreviewTask(
                 capture: capture, speech: speech, translation: translation, output: output,
+                contextualStrings: contextualStrings,
                 // L'instantané (preview Apple) va sur son callback dédié (ligne « instantané »
                 // de la superposition) ; repli sur onLine si non fourni (GUI ancienne version).
                 previewLine: configuration.onApplePreview ?? configuration.onLine
@@ -463,24 +501,70 @@ struct LiveEngine: Sendable {
 
         let translator = LocalMLXTranslator(candidate: configuration.model)
         try await translator.prepare { _, _ in }
-        var glossary: [HighQualityGlossaryPromptTerm] = []
-        if let glossaryURL = configuration.glossaryURL {
-            glossary = (try? Glossaire.terms(from: glossaryURL)) ?? []
-        }
-        if !glossary.isEmpty { Pipeline.log("glossaire : \(glossary.count) terme(s)") }
 
         // --- Boucle d'endpointing + finalisation ---------------------------
         var lastCommit = 0
         var stopRequested = false
         // État roulant de l'endpointing sémantique (mode Qwen3-ASR) :
-        // snapshot cumulatif (cadence 2 s), suivi de stabilité, historique
-        // LLM roulant (paires JA→EN, K=4) et contexte ASR roulant (JA récent).
+        // snapshot cumulé (piloté par le coordinateur pseudo-live), suivi de
+        // stabilité, historique LLM roulant (paires JA→EN, K=4) et contexte
+        // ASR roulant (JA récent).
         var snapshot = ""
-        var lastSnapshotAt = Date.distantPast
         var lastSnapshotThrough = 0
         var stabilityTracker = SnapshotStabilityTracker()
         var history: [HighQualityAcceptedTranslationPair] = []
         var committedJA = ""
+        // Pseudo-live : coordinateur des snapshots cumulatifs Qwen (cadence
+        // 2 s, coalescing, générations). `stageFinal` bloque les previews du
+        // range commité ; `previewsEnabled` = false quand MLXTRANSLATE_PSEUDO_LIVE=0
+        // (l'endpointing s'appuie alors sur le snapshot forcé au déclenchement).
+        var pseudoLiveCoordinator = QwenPseudoLiveCoordinator(
+            cadence: .productDefault,
+            previewsEnabled: useQwenFinal && configuration.pseudoLive
+        )
+
+        /// Transcription d'un snapshot pseudo-live (travail planifié par le
+        /// coordinateur) + enchaînement du travail coalescé (latest-wins).
+        /// Met à jour la sortie du modèle (`snapshot`) consommée par
+        /// l'endpointing sémantique, et alimente la ligne roulante.
+        func runPendingPreview(_ work: QwenPseudoLivePreviewWork) async {
+            guard let asrFinal else { return }
+            do {
+                let windowAudio = capture.samples(
+                    from: work.range.lowerBound, upTo: work.range.upperBound
+                )
+                let asrContext = String(committedJA.suffix(LiveSemanticEndpointer.asrContextCharacters))
+                let source = try await asrFinal.transcribe(
+                    audio: windowAudio,
+                    context: asrContext.isEmpty ? nil : asrContext
+                )
+                lastSnapshotThrough = work.range.upperBound
+                let completion = pseudoLiveCoordinator.completePreview(work, source: source)
+                if let accepted = completion.accepted {
+                    snapshot = accepted.source
+                    LiveDebug.log("PSEUDO-LIVE(Qwen) roulant \"\(accepted.source)\"")
+                    // Ligne roulante du modèle final (canal « instantané ») :
+                    // preview de meilleure qualité que l'instantané Apple.
+                    let rollingText = accepted.source
+                    let rollingTimecode = LiveFormat.timecode(
+                        Double(work.range.lowerBound) / LiveEndpointing.sampleRate
+                    )
+                    let channel = configuration.onApplePreview ?? configuration.onLine
+                    channel?(rollingText, false)
+                    Task {
+                        await output.showPreview("\(rollingTimecode) ~ \(rollingText)")
+                    }
+                }
+                if let next = completion.next {
+                    await runPendingPreview(next)
+                }
+            } catch {
+                LiveDebug.log("PSEUDO-LIVE(Qwen) en échec : \(error.localizedDescription)")
+                if let next = pseudoLiveCoordinator.failPreview(work) {
+                    await runPendingPreview(next)
+                }
+            }
+        }
 
         let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         source.setEventHandler {
@@ -498,22 +582,31 @@ struct LiveEngine: Sendable {
                 // --- Endpointing sémantique (Qwen3-ASR final + aligneur) ---
                 guard available - lastCommit >= Int(0.5 * LiveEndpointing.sampleRate) else { continue }
 
-                // 1) Snapshot : silence de fin ≥ 0,3 s déclenche une évaluation ;
-                //    la sortie du modèle (Qwen3-ASR, fenêtre entière depuis le
-                //    dernier commit, cadence 2 s, plus récent gagne) en décide.
+                // 1) Silence de fin (mesure sur la fenêtre) + snapshot du
+                //    modèle final (sortie consommée par l'endpointing) —
+                //    deux sources de snapshot, plus récent gagne :
+                //    - pseudo-live (coordinateur) : ré-transcription
+                //      cumulative de la clause en cours, cadence 2 s
+                //      (coalescing + générations ; bloqué sur les ranges
+                //      commités via stageFinal) ;
+                //    - forçage au déclenchement : si le dernier snapshot est
+                //      périmé (nouvelle audio depuis), la fenêtre est calme et
+                //      l'endpointing a besoin du texte complet — transcribe
+                //      hors cadence.
                 let tail = capture.samples(
                     from: max(lastCommit, available - Int(LiveSemanticEndpointer.forceCutSeconds * LiveEndpointing.sampleRate)),
                     upTo: available
                 )
                 let silenceSeconds = LiveSemanticEndpointer.trailingSilenceSeconds(tail)
-                let cadenceDue =
-                    Date().timeIntervalSince(lastSnapshotAt) >= LiveSemanticEndpointer.snapshotCadenceSeconds
-                        && available - lastCommit >= Int(LiveSemanticEndpointer.snapshotCadenceSeconds * LiveEndpointing.sampleRate)
+                let windowSeconds = Double(available - lastCommit) / LiveEndpointing.sampleRate
+                let triggerDue = silenceSeconds >= LiveSemanticEndpointer.triggerSilenceSeconds
+                // Filet de sécurité : la fenêtre est bornée même sans pause
+                // (parole continue) — le déclenchement passe aussi à 12 s.
+                let safetyDue = windowSeconds >= LiveSemanticEndpointer.forceCutSeconds
                 let staleAtTrigger =
-                    silenceSeconds >= LiveSemanticEndpointer.triggerSilenceSeconds
+                    (triggerDue || safetyDue)
                         && available - lastSnapshotThrough >= Int(0.5 * LiveEndpointing.sampleRate)
-                if cadenceDue || staleAtTrigger {
-                    lastSnapshotAt = Date()
+                if staleAtTrigger {
                     lastSnapshotThrough = available
                     let windowAudio = capture.samples(from: lastCommit, upTo: available)
                     let asrContext = String(committedJA.suffix(LiveSemanticEndpointer.asrContextCharacters))
@@ -524,7 +617,7 @@ struct LiveEngine: Sendable {
                             context: asrContext.isEmpty ? nil : asrContext
                         )
                         LiveDebug.log(
-                            "ASR(Qwen3) snapshot \"\(snapshot)\" "
+                            "ASR(Qwen3) snapshot (forcé au déclenchement) \"\(snapshot)\" "
                             + "(\(String(format: "%.0f", Date().timeIntervalSince(asrStarted) * 1000)) ms, "
                             + "\(String(format: "%.1f", Double(windowAudio.count) / 16000.0)) s d'audio)"
                         )
@@ -532,22 +625,37 @@ struct LiveEngine: Sendable {
                         Pipeline.log("snapshot Qwen3-ASR en échec : \(error.localizedDescription)")
                         LiveDebug.log("ASR(Qwen3) snapshot en échec : \(error.localizedDescription)")
                     }
+                } else if !safetyDue, let work = pseudoLiveCoordinator.observe(
+                    speechStart: lastCommit,
+                    availableThrough: available
+                ) {
+                    // Preview de cadence uniquement hors filet : le filet (≥ 12 s)
+                    // force la coupe, inutile de bloquer la boucle sur un snapshot.
+                    await runPendingPreview(work)
                 }
 
-                // 2) Déclenchement : silence de fin ≥ 0,3 s (sinon on attend).
-                guard silenceSeconds >= LiveSemanticEndpointer.triggerSilenceSeconds else { continue }
+                // 2) Déclenchement : silence de fin ≥ 0,3 s — ou filet de
+                //    sécurité à 12 s (borne la fenêtre même sans pause).
+                guard triggerDue || safetyDue else { continue }
 
                 // 3) Verdict sémantique : fin de phrase + stabilité (pas de
                 //    fenêtre temporelle fixe) ; 2 s de silence sur clause
                 //    incomplète → fragment ; 12 s → filet de sécurité.
                 let stable = stabilityTracker.observe(snapshot)
                 let terminal = LiveSemanticEndpointer.isTerminalJapanese(snapshot)
-                let windowSeconds = Double(available - lastCommit) / LiveEndpointing.sampleRate
+                // Signal complémentaire Apple : le transcribeur a FINALISÉ son
+                // texte jusqu'à la fin de la fenêtre disponible (marge 1 s) →
+                // le texte roulant est stable (substitut de `isStable`).
+                let appleFinalizedThrough = previewTask?.finalizedThroughSample ?? 0
+                let appleFinalized =
+                    appleFinalizedThrough > lastCommit
+                        && appleFinalizedThrough >= available - Int(1.0 * LiveEndpointing.sampleRate)
                 let decision = LiveSemanticEndpointer.evaluate(
                     silenceSeconds: silenceSeconds,
                     isTerminal: terminal,
                     isStable: stable,
-                    windowSeconds: windowSeconds
+                    windowSeconds: windowSeconds,
+                    appleFinalized: appleFinalized
                 )
                 guard decision != .hold else { continue }
 
@@ -641,11 +749,23 @@ struct LiveEngine: Sendable {
                 ))
                 history = Array(history.suffix(LiveSemanticEndpointer.historyLimit))
                 committedJA += " \(jaText)"
+                // Pseudo-live : le range est définitif — le coordinateur
+                // bloque les previews le couvrant (previewNotBefore = borne
+                // alignée) et incrémente la génération (les snapshots en vol
+                // deviennent obsolètes).
+                let finalWork = pseudoLiveCoordinator.stageFinal(
+                    range: lastCommit..<nextCommit,
+                    stableThrough: nextCommit
+                )
                 lastCommit = nextCommit
                 stabilityTracker.reset()
                 snapshot = ""
-                lastSnapshotAt = .distantPast
                 lastSnapshotThrough = 0
+                // Libère le slot final et relance l'éventuel preview coalescé
+                // (la clause suivante reprend la roulante immédiatement).
+                if let pending = pseudoLiveCoordinator.completeFinal(finalWork) {
+                    await runPendingPreview(pending)
+                }
                 previewTask?.committedSampleOffset = lastCommit
                 if lastCommit >= Int(120 * LiveEndpointing.sampleRate) {
                     capture.trim(upTo: lastCommit)
@@ -801,6 +921,7 @@ struct LiveEngine: Sendable {
         // --- Arrêt propre ----------------------------------------------------
         source.cancel()
         maxTask?.cancel()
+        pseudoLiveCoordinator.cancel()
         await previewTask?.finish()
         await capture.stop()
         await sidecar?.shutdown()

@@ -79,6 +79,8 @@ enum CLIParser {
                 --delay 960|1200|2400                  latence Voxtral (défaut : 960)
                 --sortie <fichier>                     SRT live (défaut : ~/.mlxtranslate/live-<date>.srt)
                 --max N                                arrêt automatique après N secondes
+              Env : MLXTRANSLATE_PSEUDO_LIVE=0 désactive la roulante Qwen
+                    pseudo-live (mode qwenja ; active par défaut).
             """
         }
     }

@@ -40,10 +40,20 @@ struct TranscriptionSegment: Sendable {
 struct LiveSourceUpdate: Sendable {
     var segment: TranscriptionSegment
     var isFinal: Bool
+    /// Échantillon 16 kHz jusqu'où le transcribeur a FINALISÉ des résultats
+    /// (`resultsFinalizationTime`) : borne dure du texte définitif — signal
+    /// complémentaire de l'endpointing (le texte avant cette borne ne
+    /// changera plus).
+    var finalizedThroughSample: Int
 
-    init(segment: TranscriptionSegment, isFinal: Bool) {
+    init(
+        segment: TranscriptionSegment,
+        isFinal: Bool,
+        finalizedThroughSample: Int = 0
+    ) {
         self.segment = segment
         self.isFinal = isFinal
+        self.finalizedThroughSample = finalizedThroughSample
     }
 }
 
@@ -70,6 +80,7 @@ actor AppleSpeechService {
 
     func start(
         localeIdentifier: String,
+        contextualStrings: [String] = [],
         onUpdate: @escaping @MainActor @Sendable (LiveSourceUpdate) -> Void
     ) async throws {
         await cancel()
@@ -84,6 +95,14 @@ actor AppleSpeechService {
         )
         let options = SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .lingering)
         let analyzer = SpeechAnalyzer(modules: [transcriber], options: options)
+        // Bias lexical : le glossaire (formes JA) est injecté comme « context
+        // strings » AVANT la préparation, pour que le transcribeur Apple
+        // privilégie ces termes propres (plafonné à 100 par le framework).
+        if !contextualStrings.isEmpty {
+            let context = AnalysisContext()
+            context.contextualStrings[.general] = Array(contextualStrings.prefix(100))
+            try await analyzer.setContext(context)
+        }
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(
             compatibleWith: [transcriber], considering: Self.inputFormat
         ) else {
@@ -110,6 +129,7 @@ actor AppleSpeechService {
                     guard !text.isEmpty else { continue }
                     let start = max(0, CMTimeGetSeconds(result.range.start))
                     let duration = max(0, CMTimeGetSeconds(result.range.duration))
+                    let finalizedSeconds = max(0, CMTimeGetSeconds(result.resultsFinalizationTime))
                     await onUpdate(
                         LiveSourceUpdate(
                             segment: TranscriptionSegment(
@@ -117,7 +137,8 @@ actor AppleSpeechService {
                                 end: start + duration,
                                 text: text
                             ),
-                            isFinal: result.isFinal
+                            isFinal: result.isFinal,
+                            finalizedThroughSample: Int((finalizedSeconds * 16_000).rounded())
                         )
                     )
                 }

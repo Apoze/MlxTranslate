@@ -431,6 +431,106 @@ private func runSemanticEndpointerChecks() {
     check(!tracker.observe("C", now: t0.addingTimeInterval(3.0)), "stabilité : reset → repart de zéro")
 }
 
+// MARK: - Pseudo-live (coordinateur Qwen) + context strings glossaire
+
+private func runPseudoLiveCoordinatorChecks() {
+    let sr = Int(LiveEndpointing.sampleRate)
+    let cad2 = QwenPseudoLiveCadence.productDefault.sampleCount
+
+    // Cadences : échantillons 16 kHz par intervalle.
+    checkEqual(QwenPseudoLiveCadence.seconds1.sampleCount, sr, "cadence 1 s")
+    checkEqual(QwenPseudoLiveCadence.seconds2.sampleCount, 2 * sr, "cadence 2 s")
+    checkEqual(QwenPseudoLiveCadence.seconds3.sampleCount, 3 * sr, "cadence 3 s")
+    checkEqual(QwenPseudoLiveCadence.productDefault, .seconds2, "cadence par défaut 2 s")
+
+    // Début de preview : max(notBefore, speechStart) (preRoll 0).
+    checkEqual(QwenPseudoLiveCoordinator.previewStart(speechStart: 100, notBefore: 300), 300,
+               "previewStart : notBefore > speechStart")
+    checkEqual(QwenPseudoLiveCoordinator.previewStart(speechStart: 500, notBefore: 300), 500,
+               "previewStart : speechStart > notBefore")
+
+    // Porte de cadence : rien avant, work à la cadence, coalescement ensuite.
+    var c = QwenPseudoLiveCoordinator(cadence: .seconds2)
+    check(c.observe(speechStart: 0, availableThrough: cad2 - sr) == nil,
+          "observe : avant la cadence → nil")
+    let wFirst = c.observe(speechStart: 0, availableThrough: cad2)!
+    checkEqual(wFirst.range, 0..<cad2, "observe : cadence atteinte → work [0, cad2)")
+    checkEqual(c.observe(speechStart: 0, availableThrough: 2 * cad2), nil,
+               "observe : work en vol → coalescé (nil)")
+    checkEqual(c.coalescedTickCount, 1, "coalescedTickCount incrémenté")
+    let completion = c.completePreview(wFirst, source: "s1")
+    // Le coalescé a surclassé le premier work (latest-wins) : il est obsolète.
+    check(completion.accepted == nil, "preview surclassé par un coalescé → rejeté (stale)")
+    checkEqual(c.staleResultCount, 1, "staleResultCount incrémenté")
+    checkEqual(completion.next?.range, 0..<2 * cad2, "work coalescé renvoyé (latest-wins)")
+    if let next = completion.next {
+        let done = c.completePreview(next, source: "s2")
+        checkEqual(done.accepted?.source, "s2", "coalescé à jour → accepté")
+        check(done.next == nil, "plus de work en attente")
+    }
+
+    // Preview à jour (pas de coalescé) → accepté directement.
+    var c2 = QwenPseudoLiveCoordinator(cadence: .seconds2)
+    let w2 = c2.observe(speechStart: 0, availableThrough: cad2)!
+    let ok = c2.completePreview(w2, source: "ok")
+    checkEqual(ok.accepted?.source, "ok", "preview à jour → accepté")
+    check(ok.next == nil, "pas de work coalescé")
+
+    // stageFinal : le range est définitif, les previews sont bloquées.
+    var c3 = QwenPseudoLiveCoordinator(cadence: .seconds2)
+    let final = c3.stageFinal(range: 0..<cad2, stableThrough: cad2)
+    checkEqual(c3.generation, 1, "stageFinal : génération incrémentée")
+    check(c3.observe(speechStart: 0, availableThrough: 2 * cad2) == nil,
+          "previewNotBefore : début de phrase avant la borne stable → nil")
+    check(c3.observe(speechStart: cad2, availableThrough: 2 * cad2 - sr) == nil,
+          "nouvelle phrase : avant la cadence → nil")
+    check(c3.observe(speechStart: cad2, availableThrough: 2 * cad2) == nil,
+          "final en attente : preview de cadence coalescée (nil)")
+    checkEqual(c3.completeFinal(final)?.range, cad2..<2 * cad2,
+               "completeFinal : libère le slot et renvoie le travail coalescé")
+
+    // Le preview en vol devient obsolète après un stageFinal.
+    var c4 = QwenPseudoLiveCoordinator(cadence: .seconds2)
+    let w4 = c4.observe(speechStart: 0, availableThrough: cad2)!
+    _ = c4.stageFinal(range: 0..<cad2, stableThrough: cad2)
+    let stale = c4.completePreview(w4, source: "obsolète")
+    check(stale.accepted == nil, "génération incrémentée : preview en vol obsolète")
+    checkEqual(c4.staleResultCount, 1, "staleResultCount (post stageFinal)")
+
+    // failPreview → dégradé + travail coalescé éventuel.
+    var c5 = QwenPseudoLiveCoordinator(cadence: .seconds2)
+    let w5 = c5.observe(speechStart: 0, availableThrough: cad2)!
+    check(c5.failPreview(w5) == nil, "failPreview sans pending → nil")
+    checkEqual(c5.previewStatus, .degraded, "failPreview → état dégradé")
+
+    // Préviews désactivées (MLXTRANSLATE_PSEUDO_LIVE=0) → observe silencieux.
+    var c6 = QwenPseudoLiveCoordinator(cadence: .seconds2, previewsEnabled: false)
+    check(c6.observe(speechStart: 0, availableThrough: 5 * cad2) == nil,
+          "préviews désactivées → nil")
+
+    // cancel : fin du live → plus de previews.
+    var c7 = QwenPseudoLiveCoordinator(cadence: .seconds2)
+    c7.cancel()
+    checkEqual(c7.previewStatus, .unavailable, "cancel → indisponible")
+    check(c7.observe(speechStart: 0, availableThrough: 5 * cad2) == nil,
+          "cancel : plus de previews")
+
+    // Context strings glossaire : aplatir les formes JA, dédupliquer, plafonner.
+    let terms = [
+        HighQualityGlossaryPromptTerm(id: "t1", japanese: ["子供", "子"], english: "monster", englishAliases: []),
+        HighQualityGlossaryPromptTerm(id: "t2", japanese: ["子", "  "], english: "child", englishAliases: []),
+        HighQualityGlossaryPromptTerm(id: "t3", japanese: ["  闇 "], english: "dark", englishAliases: []),
+    ]
+    checkEqual(Glossaire.contextualStrings(terms: terms), ["子供", "子", "闇"],
+               "contextualStrings : aplat + dédoublonnage + trim")
+    var many: [HighQualityGlossaryPromptTerm] = []
+    for i in 0..<150 {
+        many.append(HighQualityGlossaryPromptTerm(id: "m\(i)", japanese: ["form\(i)"], english: "e", englishAliases: []))
+    }
+    checkEqual(Glossaire.contextualStrings(terms: many).count, 100, "contextualStrings : plafond 100")
+    checkEqual(Glossaire.contextualStrings(terms: []), [], "contextualStrings : vide")
+}
+
 // MARK: - Modèles live (gated : MLXTRANSLATE_RUN_LIVE_MODELS=1)
 //
 // Charge Qwen3-ASR 1,7B JA + Qwen3-ForcedAligner (cache locaux), transcrit un
@@ -504,6 +604,7 @@ runDegradedChecks()
 runAudioSpoolChecks()
 runLiveFinalTierChecks()
 runSemanticEndpointerChecks()
+runPseudoLiveCoordinatorChecks()
 runGoldenCheck()
 await runLiveModelsCheck()
 

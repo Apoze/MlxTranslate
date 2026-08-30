@@ -65,6 +65,23 @@ enum Glossaire {
         return terms
     }
 
+    /// Formes japonaises du glossaire, à passer au Speech analyzer comme
+    /// « context strings » (bias lexical : le transcribeur Apple privilégie ces
+    /// termes propres). Aplati, dédupliqué (ordre préservé), plafonné à 100
+    /// (limite du framework).
+    static func contextualStrings(terms: [HighQualityGlossaryPromptTerm], cap: Int = 100) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for term in terms {
+            for form in term.japanese {
+                let trimmed = form.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty, seen.insert(trimmed).inserted else { continue }
+                out.append(trimmed)
+            }
+        }
+        return Array(out.prefix(cap))
+    }
+
     /// Découpe une liste de formes JA séparées par « / » et écarte
     /// les notes entre parenthèses : « 子供 (monstre) » → « 子供 ».
     private static func splitForms(_ part: String) -> [String] {
