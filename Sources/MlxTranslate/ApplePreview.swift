@@ -257,6 +257,9 @@ actor AppleTranslationService {
     private var session: TranslationSession?
 
     func configure(sourceLocale: String) async throws {
+        // Idempotence : une session déjà prête (préchargement au lancement
+        // de l'app, ou deuxième appel du moteur) → rien à faire.
+        guard session == nil else { return }
         let source = Locale.Language(identifier: sourceLocale)
         let candidate = TranslationSession(
             installedSource: source,

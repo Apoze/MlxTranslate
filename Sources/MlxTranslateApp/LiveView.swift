@@ -71,6 +71,20 @@ struct LiveView: View {
                     .frame(width: 120)
                     .disabled(model.liveASR != LiveFinalASR.voxtralQ4)
                 }
+                LabeledContent("Ligne roulante") {
+                    Picker("", selection: $model.livePreviewMode) {
+                        ForEach(Array(LivePreviewMode.allCases), id: \.self) { mode in
+                            switch mode {
+                            case .apple: Text("Apple (~250 ms)").tag(mode)
+                            case .mlx: Text("MLX (lente)").tag(mode)
+                            }
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 160)
+                    .disabled(model.liveASR != LiveFinalASR.qwenJA || !model.livePseudoLive)
+                    .help("Source de la ligne roulante : Apple basse latence (défaut) ou MLX streaming (lente, glossaire)")
+                }
             }
 
             HStack {

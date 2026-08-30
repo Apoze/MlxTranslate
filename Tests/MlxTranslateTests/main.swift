@@ -733,6 +733,140 @@ private func runLiveModelsCheck() async {
     }
 }
 
+// MARK: - endpointing « lâche » (LivePausePlanner, port WhisperASR)
+
+private func runPausePlannerChecks() {
+    let sr = Int(LiveEndpointing.sampleRate)
+    func at(_ seconds: Double) -> Int { Int(seconds * Double(sr)) }
+
+    var planner = LivePausePlanner()
+    // Sans parole dans la fenêtre → rien à décider.
+    checkEqual(planner.observe(windowStart: 0, available: at(3), trailingSilenceSeconds: 0.5, speechStart: nil), nil, "planner : fenêtre sans parole → nil")
+    // Phrase < 1,5 s + pause 0,5 s → nil (regroupement).
+    checkEqual(planner.observe(windowStart: 0, available: at(2.4), trailingSilenceSeconds: 0.5, speechStart: at(1.0)), nil, "planner : phrase de 1,4 s → nil")
+    // Phrase ≥ 1,5 s + silence ≥ 0,5 s → commit au silence.
+    checkEqual(planner.observe(windowStart: 0, available: at(2.0), trailingSilenceSeconds: 0.5, speechStart: 0), .pause, "planner : phrase de 2 s + pause 0,5 s → .pause")
+    // Silenc trop court → nil.
+    var planner2 = LivePausePlanner()
+    checkEqual(planner2.observe(windowStart: 0, available: at(2.0), trailingSilenceSeconds: 0.2, speechStart: 0), nil, "planner : pause de 0,2 s → nil")
+    // Filet dur : fenêtre ≥ 15 s → .forced (même à vide).
+    var planner3 = LivePausePlanner()
+    checkEqual(planner3.observe(windowStart: 0, available: at(15), trailingSilenceSeconds: 0, speechStart: nil), .forced, "planner : fenêtre de 15 s vide → .forced")
+    // Parole continue ≥ 15 s → .forced.
+    var planner4 = LivePausePlanner()
+    checkEqual(planner4.observe(windowStart: 0, available: at(15.2), trailingSilenceSeconds: 0, speechStart: 0), .forced, "planner : parole continue de 15,2 s → .forced")
+    // 14,9 s de parole continue → encore nil.
+    var planner5 = LivePausePlanner()
+    checkEqual(planner5.observe(windowStart: 0, available: at(14.9), trailingSilenceSeconds: 0, speechStart: 0), nil, "planner : parole continue de 14,9 s → nil")
+    // Persistance entre observations (début de phrase mémorisé) :
+    // 1re observation avant le début de la parole, 2e après.
+    var planner6 = LivePausePlanner()
+    checkEqual(planner6.observe(windowStart: 0, available: at(1.0), trailingSilenceSeconds: 0.5, speechStart: nil), nil, "planner : pré-parole → nil")
+    checkEqual(planner6.observe(windowStart: 0, available: at(2.5), trailingSilenceSeconds: 0.5, speechStart: 0), .pause, "planner : début de parole mémorisé → .pause")
+    // Reset après commit : nouvelle fenêtre, pas de « pause » immédiate.
+    var planner7 = LivePausePlanner()
+    checkEqual(planner7.observe(windowStart: 0, available: at(2.0), trailingSilenceSeconds: 0.5, speechStart: 0), .pause, "planner : commit")
+    planner7.reset()
+    checkEqual(planner7.observe(windowStart: at(2.0), available: at(2.5), trailingSilenceSeconds: 0, speechStart: at(2.0)), nil, "planner : après reset, phrase de 0,5 s → nil")
+
+    // firstSpeechSample (VAD de fenêtre, RMS) :
+    let frame = LiveEndpointing.frameSamples
+    let zeros = [Float](repeating: 0, count: 10 * frame)
+    checkEqual(LivePausePlanner.firstSpeechSample(samples: zeros, windowStart: 0), nil, "planner VAD : fenêtre silencieuse → nil")
+    var speech = zeros
+    speech[3 * frame] = 0.5
+    checkEqual(LivePausePlanner.firstSpeechSample(samples: speech, windowStart: 0), 3 * frame, "planner VAD : parole à 3,0 s → échantillon \(3 * frame)")
+    var midFrame = [Float](repeating: 0, count: 5 * frame)
+    midFrame[2500] = 0.5
+    checkEqual(LivePausePlanner.firstSpeechSample(samples: midFrame, windowStart: 100_000), 100_000 + frame, "planner VAD : frame de parole décalée → début de frame")
+    var atThreshold = [Float](repeating: 0, count: 2 * frame)
+    atThreshold[frame] = LiveEndpointing.silenceThreshold
+    checkEqual(LivePausePlanner.firstSpeechSample(samples: atThreshold, windowStart: 0), frame, "planner VAD : amplitude au seuil → parole")
+    var belowThreshold = [Float](repeating: 0, count: 2 * frame)
+    belowThreshold[frame] = LiveEndpointing.silenceThreshold - 0.0001
+    checkEqual(LivePausePlanner.firstSpeechSample(samples: belowThreshold, windowStart: 0), nil, "planner VAD : amplitude sous le seuil → silence")
+}
+
+// MARK: - repli des répétitions dégénérées (LiveRepetition)
+
+private func runRepetitionChecks() {
+    // « はい、 » × 100 (musique/silence) → unité × 3 + « … ».
+    checkEqual(
+        LiveRepetition.collapse(String(repeating: "はい、", count: 100)),
+        String(repeating: "はい、", count: 3) + "…",
+        "repli : 「はい、」×100 → 3 unités + …"
+    )
+    // Tronquage en pleine unité (sortie ASR coupée) : le reste est conservé.
+    checkEqual(
+        LiveRepetition.collapse(String(repeating: "はい、", count: 100) + "は"),
+        String(repeating: "はい、", count: 3) + "は" + "…",
+        "repli : répétition + reste partiel → 3 unités + reste + …"
+    )
+    // Texte normal (≥ minRun, non périodique) → inchangé.
+    let normal = "今日はいい天気ですね、散歩にはもってこいですよ、ぜひ一緒にどうですか、本当にありがとうごさいた。"
+    checkEqual(LiveRepetition.collapse(normal), normal, "repli : texte normal ≥ 40 car. → inchangé")
+    // Trop court (< minRun) → inchangé.
+    checkEqual(LiveRepetition.collapse("あ"), "あ", "repli : texte court → inchangé")
+    checkEqual(
+        LiveRepetition.collapse(String(repeating: "はい、", count: 10)),
+        String(repeating: "はい、", count: 10),
+        "repli : 30 caractères (< minRun) → inchangé"
+    )
+    // Unité latine.
+    checkEqual(
+        LiveRepetition.collapse(String(repeating: "abc", count: 20)),
+        String(repeating: "abc", count: 3) + "…",
+        "repli : « abc »×20 → 3 unités + …"
+    )
+    // Préfixe normal + répétition en fin de texte : le préfixe est conservé.
+    checkEqual(
+        LiveRepetition.collapse("こんにちは " + String(repeating: "いい、", count: 20)),
+        "こんにちは " + String(repeating: "いい、", count: 3) + "…",
+        "repli : préfixe + répétition → préfixe conservé"
+    )
+    // Répétition d'un caractère (période 1).
+    checkEqual(
+        LiveRepetition.collapse(String(repeating: "a", count: 50)),
+        "aaa…",
+        "repli : « a »×50 → 3 caractères + …"
+    )
+}
+
+// MARK: - dédoublonnage SRT des cues identiques (LiveOutput)
+
+private func runLiveOutputDedupChecks() async {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mlx-dedup-\(UUID().uuidString)")
+    let fileURL = dir.appendingPathComponent("out.srt")
+    let out = LiveOutput(fileURL: fileURL)
+
+    let i1 = await out.commit(start: 0, end: 2, japanese: "こんにちは", english: "hello", show: false)
+    let i2 = await out.commit(start: 2, end: 4, japanese: "世界", english: "world", show: false)
+    let i3 = await out.commit(start: 4, end: 6, japanese: "世界", english: "world", show: false)
+    let i4 = await out.commit(start: 6, end: 8, japanese: "また", english: "world", show: false)
+    let i5 = await out.commit(start: 8, end: 10, japanese: "さようなら", english: "goodbye", show: false)
+
+    checkEqual(i1, 1, "SRT dedup : premier cue → index 1")
+    checkEqual(i2, 2, "SRT dedup : second cue → index 2")
+    checkEqual(i3, 2, "SRT dedup : texte identique → dernier cue (pas de nouveau)")
+    checkEqual(i4, 2, "SRT dedup : identique au dernier (étendu) → toujours le dernier")
+    checkEqual(i5, 3, "SRT dedup : texte différent → nouveau cue")
+    let count = await out.committedCount
+    checkEqual(count, 3, "SRT dedup : 3 cues (pas 5)")
+
+    let srtText = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+    check(srtText.contains("00:00:02,000 --> 00:00:08,000"), "SRT dedup : le cue dupliqué est ÉTENDU (fin 8 s)")
+    checkEqual(srtText.components(separatedBy: "world").count - 1, 1, "SRT dedup : « world » n'apparaît qu'une fois")
+    check(srtText.contains("hello") && srtText.contains("goodbye"), "SRT dedup : cues distincts conservés")
+
+    // Mode sans-traduction : le texte dédupliqué est le JA (« (JA) … »).
+    let out2 = LiveOutput(fileURL: dir.appendingPathComponent("out-ja.srt"))
+    let j1 = await out2.commit(start: 0, end: 1, japanese: "はい", english: nil, show: false)
+    let j2 = await out2.commit(start: 1, end: 2, japanese: "はい", english: nil, show: false)
+    checkEqual(j1, 1, "SRT dedup JA : premier cue → 1")
+    checkEqual(j2, 1, "SRT dedup JA : JA identique → dernier cue")
+    checkEqual(await out2.committedCount, 1, "SRT dedup JA : 1 cue")
+}
+
 // MARK: - point d'entrée
 
 runSRTChecks()
@@ -746,6 +880,9 @@ runSemanticEndpointerChecks()
 runPseudoLiveCoordinatorChecks()
 runPreviewMonotoneChecks()
 runLiveOverlayStateChecks()
+runPausePlannerChecks()
+runRepetitionChecks()
+await runLiveOutputDedupChecks()
 runGoldenCheck()
 await runLiveModelsCheck()
 

@@ -34,6 +34,9 @@ struct Command {
     var listApps: Bool = false
     /// Cadence des snapshots roulants Qwen (live uniquement ; 1/2/3 s).
     var liveCadence: QwenPseudoLiveCadence = .productDefault
+    /// Source de la ligne roulante EN du live (mode Qwen) : Apple basse
+    /// latence (défaut) ou MLX streaming (option lente, glossaire).
+    var livePreviewSource: LivePreviewMode = .productDefault
     /// Modèle EN du live : `--modele` explicite, sinon le défaut live
     /// (qwen3-1.7b — distinct du défaut offline, `model`).
     var liveModel: LocalMLXTranslator.Candidate = .productDefault
@@ -92,6 +95,8 @@ enum CLIParser {
                 --cadence 1|2|3                        cadence des snapshots roulants Qwen en
                                                        secondes (défaut : 2 ; prise en compte
                                                        au démarrage du live)
+                --preview-source apple|mlx             ligne roulante : Apple (basse latence,
+                                                        défaut) ou MLX streaming (lente)
                 --glossaire <chemin>                   glossaire de la traduction EN
                 --live-asr qwenja|voxtral              ASR final (défaut : qwenja, Qwen3-ASR 1,7B JA)
                 --delay 960|1200|2400                  latence Voxtral (défaut : 960)
@@ -131,6 +136,7 @@ enum CLIParser {
         var liveASR = LiveFinalASR.productDefault
         var listApps = false
         var liveCadence = QwenPseudoLiveCadence.productDefault
+        var livePreviewSource = LivePreviewMode.productDefault
         // `--modele` explicit (live) : sinon le défaut live (qwen3-1.7b) s'applique
         // indépendamment du défaut offline (qwen3-8b).
         var modelExplicit = false
@@ -180,6 +186,13 @@ enum CLIParser {
                     throw unknown("--cadence doit être 1, 2 ou 3")
                 }
                 liveCadence = parsed
+                index += 1
+            case "--preview-source":
+                guard index + 1 < arguments.count else { throw unknown("--preview-source sans valeur") }
+                guard let parsed = LivePreviewMode(rawValue: arguments[index + 1].lowercased()) else {
+                    throw unknown("--preview-source doit être apple ou mlx")
+                }
+                livePreviewSource = parsed
                 index += 1
             case "--noms":
                 guard index + 1 < arguments.count else { throw unknown("--noms sans valeur") }
@@ -280,6 +293,7 @@ enum CLIParser {
                 maxSeconds: maxSeconds,
                 listApps: listApps,
                 liveCadence: liveCadence,
+                livePreviewSource: livePreviewSource,
                 liveModel: liveModel
             )
         }

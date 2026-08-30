@@ -13,6 +13,63 @@ final class StopFlag: @unchecked Sendable {
     func reset() { lock.lock(); flag = false; lock.unlock() }
 }
 
+/// Préchargement des modèles du live au lancement de l'app (GUI) :
+/// ASR (Qwen3-ASR 1.7B), aligneur, traducteur EN (qwen3-1.7b — défaut du
+/// live) et Apple Translation (réchauffée, ~250 ms) se chargent en arrière-
+/// plan. `startLive` RÉUTILISE ces instances (les gardes d'idempotence de
+/// `prepare`/`configure` évitent tout double chargement) — le live démarre
+/// en quelques secondes au lieu de ~30–40 s de chargement. Les instances
+/// sont exposées immédiatement (préparation en vol) : si le live démarre
+/// pendant le chargement, le `prepare` du moteur s'empile derrière sur
+/// l'actor et saute — jamais deux modèles chargés en mémoire.
+@available(macOS 26.4, *)
+@MainActor
+final class LiveModelPreloader {
+    static let shared = LiveModelPreloader()
+    private init() {}
+
+    private(set) var asr: Qwen3ASRFinalRuntime?
+    private(set) var aligner: Qwen3AlignerRuntime?
+    private(set) var translator: LocalMLXTranslator?
+    private(set) var translation: AppleTranslationService?
+    private var started = false
+
+    /// Démarre le préchargement en arrière-plan (une seule fois).
+    func start() {
+        guard !started else { return }
+        started = true
+        // Instances créées maintenant (préparation en vol) — réutilisables
+        // immédiatement par `startLive`, même avant la fin du chargement.
+        let asr = Qwen3ASRFinalRuntime()
+        let aligner = Qwen3AlignerRuntime()
+        let translator = LocalMLXTranslator(candidate: .qwen3_1B7)
+        let translation = AppleTranslationService()
+        self.asr = asr
+        self.aligner = aligner
+        self.translator = translator
+        self.translation = translation
+        Task { [weak self] in
+            // Quatre chargements en parallèle (actors indépendants) — le plus
+            // lent (ASR, ~20 s) fixe la durée ; UI non bloquée (MainActor en pause).
+            async let asrLoad: Void = try asr.prepare(progress: { _, _ in })
+            async let alignerLoad: Void = try aligner.prepare(progress: { _, _ in })
+            async let translatorLoad: Void = try translator.prepare(progress: { _, _ in })
+            async let translationLoad: Void = try translation.configure(sourceLocale: "ja")
+            do {
+                _ = try await (asrLoad, alignerLoad, translatorLoad, translationLoad)
+            } catch {
+                MlxTranslate.LiveDebug.log("Préchargement live : \(error.localizedDescription)")
+            }
+            await MainActor.run { self?.preloadFinished() }
+        }
+    }
+
+    private func preloadFinished() {
+        // Signal de journalisation (les instances sont déjà exposées).
+        MlxTranslate.LiveDebug.log("Préchargement live terminé (ASR + aligneur + qwen3-1.7b + Apple Translation)")
+    }
+}
+
 // Modèle partagé de l'app (fenêtre + barre des menus). Isolé au MainActor ; les
 // mutations de @Published se font sur le thread principal.
 @MainActor
@@ -46,6 +103,14 @@ final class AppModel: ObservableObject {
         }
     }
     private static let cadenceDefaultsKey = "mlxtranslate.live.cadence"
+    /// Source de la ligne roulante (mode Qwen) : Apple basse latence (défaut,
+    /// ~250 ms chaud) ou MLX streaming (lente, glossaire). Persistée.
+    @Published var livePreviewMode: LivePreviewMode = .productDefault {
+        didSet {
+            UserDefaults.standard.set(livePreviewMode.rawValue, forKey: Self.previewModeDefaultsKey)
+        }
+    }
+    private static let previewModeDefaultsKey = "mlxtranslate.live.previewMode"
     @Published var liveDelay: VoxtralTranscriptionDelay = .milliseconds960
     @Published var liveRunning = false
     @Published var liveStatus = ""
@@ -65,6 +130,17 @@ final class AppModel: ObservableObject {
         if let raw = UserDefaults.standard.object(forKey: Self.cadenceDefaultsKey) as? Int,
            let cadence = QwenPseudoLiveCadence(rawValue: raw) {
             liveCadence = cadence
+        }
+        // Source de la ligne roulante (persistance GUI) — défaut : Apple
+        // basse latence (LivePreviewMode.productDefault).
+        if let raw = UserDefaults.standard.object(forKey: Self.previewModeDefaultsKey) as? String,
+           let mode = LivePreviewMode(rawValue: raw) {
+            livePreviewMode = mode
+        }
+        // Préchargement des modèles du live (arrière-plan) : le premier
+        // « Live » démarre sans attendre le chargement MLX/ASR.
+        if #available(macOS 26.4, *) {
+            LiveModelPreloader.shared.start()
         }
         let env = ProcessInfo.processInfo.environment
         // Pré-sélection de l'app live (test / script).
@@ -181,6 +257,18 @@ final class AppModel: ObservableObject {
                 config.liveASR = asrMode
                 config.pseudoLive = pseudoLive
                 config.pseudoLiveCadence = cadence
+                // Source de la ligne roulante (Apple basse latence par défaut).
+                config.previewMode = livePreviewMode
+                // Modèles préchargés au lancement (idempotence des `prepare` :
+                // pas de double chargement même si le préchargement est encore
+                // en cours — le `prepare` du moteur s'empile et saute).
+                let preloader = LiveModelPreloader.shared
+                config.preloadedASR = preloader.asr
+                config.preloadedAligner = preloader.aligner
+                // Le traducteur préchargé est le défaut live (qwen3-1.7b) —
+                // on ne le réutilise que si le modèle sélectionné est le même.
+                config.preloadedTranslator = (model == .qwen3_1B7) ? preloader.translator : nil
+                MlxTranslate.LivePreloadedTranslation.service = preloader.translation
                 // Lignes de la superposition (2 lignes, `LiveOverlayState`) :
                 // l'APERÇU roulant (Apple basse latence + snapshots Qwen)
                 // reste en bas (blanc) ; le FINAL EN stable s'engage et fait
