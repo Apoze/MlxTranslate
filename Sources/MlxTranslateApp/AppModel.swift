@@ -148,6 +148,7 @@ final class AppModel: ObservableObject {
                 )
                 // Superposition : le texte EN courant (preview en streaming, final engagé).
                 config.onLine = { [weak weakModel = self] text, isFinal in
+                    MlxTranslate.LiveDebug.log("onLine isFinal=\(isFinal) text=\"\(text)\"")
                     DispatchQueue.main.async {
                         MainActor.assumeIsolated {
                             weakModel?.overlay.set(text: text, isFinal: isFinal)

@@ -1,15 +1,55 @@
 import Foundation
 import os
 
-// Moteur du mode temps réel (live) : audio d'une application (JA) → sous-titres EN.
-//
-// Trois composants parallèles :
-//   1. Source JA finale   = Voxtral 4B (sidecar, par énoncé) sur l'audio tamponné.
-//   2. Preview (bas, synchro) = Speech Apple (JA progressif) + Translation EN.
-//   3. Traduction EN finale = LocalMLXTranslator (par énoncé, streaming) qui
-//      remplace la preview à la fin de l'énoncé et s'engage dans le SRT live.
-//
-// Endpointing : pause silencieuse ≥ 300 ms (RMS) ou forçage à 12 s.
+// Journal de debug du live (activé par `MLXTRANSLATE_DEBUG=1`) : horodaté (ISO8601 +
+// t+ depuis le démarrage), écrit sur stderr et (optionnel) en append dans
+// `MLXTRANSLATE_DEBUG_LOG` (sinon `~/.mlxtranslate/live-debug.log`). Sert à tracer
+// l'enchaînement endpointing → ASR (Voxtral) → preview (Apple) → traduction EN
+// (preview/final, MLX) → superposition, avec les timings.
+public enum LiveDebug {
+    public static let enabled = ProcessInfo.processInfo.environment["MLXTRANSLATE_DEBUG"] != nil
+    private static let start = Date()
+    private static let lock = NSLock()
+    private static let wallClock: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f
+    }()
+
+    private static var logURL: URL {
+        if let custom = ProcessInfo.processInfo.environment["MLXTRANSLATE_DEBUG_LOG"] {
+            return URL(fileURLWithPath: custom)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".mlxtranslate")
+            .appendingPathComponent("live-debug.log")
+    }
+
+    /// Horodatage (heure murale + t+ depuis le début du live) + message, sur stderr
+    /// et en append dans le fichier de debug (si activé).
+    public static func log(_ message: @autoclosure () -> String) {
+        guard enabled else { return }
+        let now = Date()
+        let t = now.timeIntervalSince(start)
+        let line = "[live-debug \(wallClock.string(from: now)) t+\(String(format: "%.2f", t)) s] \(message())\n"
+        lock.lock()
+        defer { lock.unlock() }
+        FileHandle.standardError.write(Data(line.utf8))
+        let url = logURL
+        if let fh = try? FileHandle(forWritingTo: url) {
+            fh.seekToEndOfFile()
+            fh.write(Data(line.utf8))
+            try? fh.close()
+        } else {
+            try? FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try? Data(line.utf8).write(to: url)
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Sortie live (lignes preview sur stderr, engagement final sur stdout + SRT)
@@ -107,12 +147,22 @@ final class LivePreviewTask: @unchecked Sendable {
     /// Début (échantillons 16 kHz) de l'énoncé en cours — mis à jour par le
     /// moteur live après chaque commit ; sert d'horodatage aux previews.
     var committedSampleOffset = 0
+    /// Callback de la preview basse latence (JA→EN roulant) : alimente la
+    /// superposition GUI (l'outil CLI passe nil → pas de superposition).
+    var previewLine: (@Sendable (String, Bool) -> Void)?
 
-    init(capture: AppCapture, speech: AppleSpeechService, translation: AppleTranslationService, output: LiveOutput) {
+    init(
+        capture: AppCapture,
+        speech: AppleSpeechService,
+        translation: AppleTranslationService,
+        output: LiveOutput,
+        previewLine: (@Sendable (String, Bool) -> Void)? = nil
+    ) {
         self.capture = capture
         self.speech = speech
         self.translation = translation
         self.output = output
+        self.previewLine = previewLine
     }
 
     @MainActor
@@ -152,6 +202,7 @@ final class LivePreviewTask: @unchecked Sendable {
               Date().timeIntervalSince(lastTranslateTime) >= 0.7,
               !ja.isEmpty else { return }
         do {
+            let started = Date()
             let en = try await translation.translate(ja)
             let now = Date()
             jaLock.withLock { lastTranslatedJA = ja }
@@ -159,6 +210,14 @@ final class LivePreviewTask: @unchecked Sendable {
             // Début de l'énoncé en cours ≈ dernier commit (0 sinon).
             let utteranceStart = Double(committedSampleOffset) / LiveEndpointing.sampleRate
             let timecode = LiveFormat.timecode(utteranceStart)
+            LiveDebug.log(
+                "PREVIEW(Apple) JA=\"\(ja)\" → EN=\"\(en)\" "
+                + "(traduction \(String(format: "%.0f", now.timeIntervalSince(started) * 1000)) ms) "
+                + "→ onLine preview"
+            )
+            // Superposition : preview basse latence (remplacée par le final MLX à la fin
+            // de l'énoncé). L'outil CLI (pas de superposition) ne reçoit pas ce callback.
+            previewLine?(en, false)
             await output.showPreview("\(timecode) ~ \(en)")
         } catch { /* best-effort */ }
     }
@@ -261,13 +320,20 @@ struct LiveEngine: Sendable {
     private func transcribeUtterance(helper: VoxtralHelperRuntime, audio: [Float]) async -> String {
         var text = ""
         do {
+            let started = Date()
             _ = try await helper.startSession()
             if !audio.isEmpty {
                 try await helper.append(samples: audio, range: 0..<audio.count)
             }
             text = try await helper.stopAndFlush()
+            LiveDebug.log(
+                "ASR(Voxtral) JA=\"\(text)\" "
+                + "(\(String(format: "%.0f", Date().timeIntervalSince(started) * 1000)) ms, "
+                + "\(String(format: "%.1f", Double(audio.count) / 16000.0)) s d'audio)"
+            )
         } catch {
             Pipeline.log("énoncé Voxtral en échec : \(error.localizedDescription)")
+            LiveDebug.log("ASR(Voxtral) échec : \(error.localizedDescription)")
             await helper.cancel()
         }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -321,7 +387,8 @@ struct LiveEngine: Sendable {
                 Pipeline.log("preview : \(error.localizedDescription)")
             }
             previewTask = LivePreviewTask(
-                capture: capture, speech: speech, translation: translation, output: output
+                capture: capture, speech: speech, translation: translation, output: output,
+                previewLine: configuration.onLine
             )
             if let task = previewTask {
                 do {
@@ -386,12 +453,18 @@ struct LiveEngine: Sendable {
             let utteranceAudio = capture.samples(from: lastCommit, upTo: cut)
             let startSeconds = Double(lastCommit) / LiveEndpointing.sampleRate
             let endSeconds = Double(cut) / LiveEndpointing.sampleRate
+            LiveDebug.log(
+                "ENDPOINTING énoncé [\(String(format: "%.1f", startSeconds))–\(String(format: "%.1f", endSeconds)) s] "
+                + "(durée \(String(format: "%.1f", endSeconds - startSeconds)) s) → ASR + traduction"
+            )
 
             let jaText = await transcribeUtterance(helper: sidecar, audio: utteranceAudio)
 
             var enText: String?
             if !configuration.sansTraduction {
                 do {
+                    let translateStarted = Date()
+                    let chunkCounter = OSAllocatedUnfairLock(initialState: 0)
                     enText = try await translator.translateLive(
                         japanese: jaText,
                         glossary: glossary,
@@ -399,6 +472,8 @@ struct LiveEngine: Sendable {
                         sourceEnd: endSeconds,
                         onChunk: { chunk in
                             if !chunk.isEmpty {
+                                let n = chunkCounter.withLock { $0 += 1; return $0 }
+                                LiveDebug.log("MLX chunk #\(n) (preview cumulée) = \"\(chunk)\"")
                                 configuration.onLine?(chunk, false)
                                 Task {
                                     await output.showPreview("\(LiveFormat.timecode(startSeconds)) ~ \(chunk)")
@@ -407,8 +482,14 @@ struct LiveEngine: Sendable {
                         }
                     )
                     if enText?.isEmpty == true { enText = nil }
+                    let chunkTotal = chunkCounter.withLock { $0 }
+                    LiveDebug.log(
+                        "TRAD(MLX) FINAL EN=\"\(enText ?? "")\" "
+                        + "(\(String(format: "%.0f", Date().timeIntervalSince(translateStarted) * 1000)) ms, \(chunkTotal) chunks)"
+                    )
                 } catch {
                     Pipeline.log("traduction EN en échec : \(error.localizedDescription)")
+                    LiveDebug.log("TRAD(MLX) échec : \(error.localizedDescription)")
                 }
             }
 
@@ -422,7 +503,10 @@ struct LiveEngine: Sendable {
             )
             // Superposition : engagement du final EN (ou JA si sans-traduction).
             let finalEN = enText ?? (configuration.sansTraduction ? jaText : "")
-            if !finalEN.isEmpty { configuration.onLine?(finalEN, true) }
+            if !finalEN.isEmpty {
+                LiveDebug.log("FINAL onLine isFinal=true EN=\"\(finalEN)\"")
+                configuration.onLine?(finalEN, true)
+            }
 
             lastCommit = cut
             previewTask?.committedSampleOffset = lastCommit

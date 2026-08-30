@@ -178,12 +178,37 @@ open build/MlxTranslate.app
   de la latence Voxtral ; **Démarrer/Arrêter** capture l'audio de l'application,
   alimente la superposition et écrit le SRT live dans `~/.mlxtranslate`.
 - **Superposition** : une barre de sous-titres **transparente, flottante et
-  déplaçable** (fenêtre séparée de l'app) affiche l'EN en cours (preview
-  atténuée → final en blanc), style « sous-titres YouTube ». Sa position est
-  mémorisée. Menu **Superposition** (de l'app) pour l'afficher/masquer.
+  déplaçable** (fenêtre séparée de l'app) affiche l'EN en cours, style «
+  sous-titres YouTube » : la **preview basse latence** (Apple, atténuée) s'affiche
+  pendant la parole, puis le **final MLX** (blanc, stable) la remplace à
+  l'engagement de l'énoncé. Sa position est mémorisée. Menu **Superposition**
+  (de l'app) pour l'afficher/masquer.
 - **Barre des menus** : une icône (bulle de sous-titres) permet de démarrer/arrêter
   le live, afficher la superposition, ouvrir la fenêtre, sans ouvrir l'app.
 
 La capture live passe par ScreenCaptureKit : l'accord « Enregistrement de
 l'écran » s'accorde **à l'app** (`com.apoze.mlxtranslate`), pas au terminal —
 voir `docs/tcc.md`.
+
+### Debug du mode live
+
+Le flux live (ASR → preview → traduction → superposition) est instrumenté par un
+log de débogage activable, utile pour diagnostiquer les problèmes d'affichage ou
+de latence :
+
+```
+MLXTRANSLATE_DEBUG=1 open build/MlxTranslate.app   # ou lancer le binaire directement
+```
+
+Chaque événement du pipeline est horodaté (heure murale + `t+` depuis le début du
+live) et écrit sur **stderr** et dans un fichier :
+
+- `MLXTRANSLATE_DEBUG=1` : active le log.
+- `MLXTRANSLATE_DEBUG_LOG=/chemin.log` : fichier cible (défaut
+  `~/.mlxtranslate/live-debug.log`).
+
+Les lignes couvertes : `ENDPOINTING` (coupe d'énoncé), `ASR(Voxtral)` (JA + durée),
+`PREVIEW(Apple)` (JA→EN basse latence), `MLX chunk` (streaming cumulé),
+`TRAD(MLX) FINAL` (EN final + durée + nb chunks), `FINAL onLine`, `onLine` et
+`SUPERPOSITION set` (ce que la barre reçoit). Le préfixe `[live-debug …]` filtre
+facilement le flux.

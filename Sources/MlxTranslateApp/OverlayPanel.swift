@@ -1,4 +1,5 @@
 import AppKit
+import MlxTranslate
 
 /// Superposition de sous-titres live : une NSPanel sans bordure, transparente,
 /// flottante (au-dessus des autres fenêtres) et non-activante (ne vole pas la focus),
@@ -65,6 +66,7 @@ final class OverlayController: NSObject, NSWindowDelegate {
     /// Met à jour la barre avec le texte EN courant. La preview (EN en cours de
     /// traduction) s'affiche en atténué ; le final s'affiche en blanc plein.
     func set(text: String, isFinal: Bool) {
+        LiveDebug.log("SUPERPOSITION set isFinal=\(isFinal) text=\"\(text)\"")
         label.stringValue = text
         label.textColor = isFinal ? .white : NSColor.white.withAlphaComponent(0.65)
         if text.isEmpty {

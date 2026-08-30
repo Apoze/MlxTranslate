@@ -418,11 +418,28 @@ actor LocalMLXTranslator {
     }
 
     /// Sortie « propre » pour l'affichage live : retire les lignes de marqueurs
-    /// et conserve l'anglais.
-    private static func cleanLive(_ raw: String) -> String {
+    /// (complets `<<<...>>>` ET partiels en cours de streaming, ex. `<<`,
+    /// `<<<CURRENT:live`, `<<<CURRENT:live>>`) et conserve l'anglais.
+    /// Interne (et non privé) pour permettre le test de régression.
+    static func cleanLive(_ raw: String) -> String {
         let lines = raw.components(separatedBy: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty && !($0.hasPrefix("<<<") && $0.hasSuffix(">>>")) }
+            .compactMap { line -> String? in
+                guard !line.isEmpty else { return nil }
+                // Ligne de marqueur complète (« <<<CURRENT:x>>> ») → retirée.
+                guard !(line.hasPrefix("<<<") && line.hasSuffix(">>>")) else { return nil }
+                // Marqueur partiel : on retire tout ce qui commence à « << » s'il ne
+                // contient pas de « >>> » (marqueur pas encore fermé). Ex.
+                // « Let's go! << » → « Let's go! », « <<<CURRENT:live » → « ».
+                if let idx = line.range(of: "<<") {
+                    let tail = line[idx.lowerBound...]
+                    guard tail.contains(">>>") else {
+                        let prefix = String(line[..<idx.lowerBound]).trimmingCharacters(in: .whitespaces)
+                        return prefix.isEmpty ? nil : prefix
+                    }
+                }
+                return line
+            }
         return lines.joined(separator: " ").trimmingCharacters(in: .whitespaces)
     }
 

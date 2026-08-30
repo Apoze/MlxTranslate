@@ -274,11 +274,41 @@ private func runAudioSpoolChecks() {
     try? FileManager.default.removeItem(at: tmp)
 }
 
+// MARK: - cleanLive (suppression des marqueurs, streaming)
+
+private func runCleanLiveChecks() {
+    // Marqueurs complets retirés, texte anglais conservé.
+    checkEqual(
+        LocalMLXTranslator.cleanLive("<<<CURRENT:live>>>\nLet's go!\n<<<END_CURRENT:live>>>"),
+        "Let's go!",
+        "cleanLive : marqueurs complets retirés"
+    )
+    // Marqueurs partiels en cours de streaming (sans « >>> ») retirés.
+    checkEqual(LocalMLXTranslator.cleanLive("<<"), "", "cleanLive : « << » partiel")
+    checkEqual(LocalMLXTranslator.cleanLive("<<<CURRENT"), "", "cleanLive : « <<<CURRENT » partiel")
+    checkEqual(LocalMLXTranslator.cleanLive("<<<CURRENT:live>>"), "", "cleanLive : « <<<CURRENT:live>> » partiel")
+    // Texte + marqueur partiel en fin de ligne → le texte est conservé.
+    checkEqual(
+        LocalMLXTranslator.cleanLive("<<<CURRENT:live>>>\nLet's go!\n<<"),
+        "Let's go!",
+        "cleanLive : texte + « << » partiel"
+    )
+    checkEqual(
+        LocalMLXTranslator.cleanLive("<<<CURRENT:live>>>\nLet's go!\n<<<END"),
+        "Let's go!",
+        "cleanLive : texte + « <<<END » partiel"
+    )
+    // Texte simple sans marqueur.
+    checkEqual(LocalMLXTranslator.cleanLive("Let's go!"), "Let's go!", "cleanLive : texte simple")
+    checkEqual(LocalMLXTranslator.cleanLive(""), "", "cleanLive : entrée vide")
+}
+
 // MARK: - point d'entrée
 
 runSRTChecks()
 runEndpointingChecks()
 runCLIParserChecks()
+runCleanLiveChecks()
 runDegradedChecks()
 runAudioSpoolChecks()
 runGoldenCheck()
