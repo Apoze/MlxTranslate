@@ -29,6 +29,8 @@ let package = Package(
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", exact: "1.1.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", exact: "0.9.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.3.3"),
+        // Runtime ASR Qwen3-ASR + aligneur forcé (vendu, mêmes pins MLX que ci-dessus).
+        .package(path: "Vendor/SpeechSwiftPrototype"),
     ],
     targets: [
         // Bibliothèque : pipeline (SRT, CLIParser, Live, ASR, ...) — pas de point
@@ -44,6 +46,8 @@ let package = Package(
                 .product(name: "SpeakerKit", package: "WhisperKit"),
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "Qwen3ASR", package: "SpeechSwiftPrototype"),
+                .product(name: "AudioCommon", package: "SpeechSwiftPrototype"),
             ],
             path: "Sources/MlxTranslate",
             exclude: ["Runtime/VoxtralHelper"],
@@ -71,7 +75,11 @@ let package = Package(
         // Lancement : `swift run mlxtranslatetests` (sort 0 si vert, 1 sinon).
         .executableTarget(
             name: "MlxTranslateTests",
-            dependencies: ["MlxTranslate"],
+            dependencies: [
+                "MlxTranslate",
+                .product(name: "Qwen3ASR", package: "SpeechSwiftPrototype"),
+                .product(name: "AudioCommon", package: "SpeechSwiftPrototype"),
+            ],
             path: "Tests/MlxTranslateTests"
         ),
         // App GUI (SwiftUI) : une fine couche sur la librairie. Fenêtre principale

@@ -1,4 +1,6 @@
+import AudioCommon
 import Foundation
+import Qwen3ASR
 @testable import MlxTranslate
 
 // Suite de tests autoportante (pas de XCTest / swift-testing dans le toolchain
@@ -303,6 +305,103 @@ private func runCleanLiveChecks() {
     checkEqual(LocalMLXTranslator.cleanLive(""), "", "cleanLive : entrée vide")
 }
 
+// MARK: - Live final tier (garde des vides, parse --live-asr, modèles optionnels)
+
+private func runLiveFinalTierChecks() {
+    // Défauts du tier final.
+    checkEqual(LiveFinalASR.productDefault, .qwenJA, "tier final par défaut : qwenja")
+    checkEqual(LiveFinalASR.cliValue("qwenja"), .qwenJA, "parse qwenja")
+    checkEqual(LiveFinalASR.cliValue("VOXTRAL"), .voxtralQ4, "parse voxtral (insensible à la casse)")
+    check(LiveFinalASR.cliValue("autre") == nil, "parse inconnu → nil")
+
+    // Garde des vides : on ne nourrit jamais le LLM avec une entrée vide.
+    checkEqual(LiveClauseSelection.select(qwenJapanese: "こんにちは", appleJapanese: "こんにちは"),
+               "こんにちは", "qwen non vide → qwen")
+    checkEqual(LiveClauseSelection.select(qwenJapanese: "  ", appleJapanese: "こんにちは"),
+               "こんにちは", "qwen vide → fallback Apple")
+    checkEqual(LiveClauseSelection.select(qwenJapanese: "  ", appleJapanese: nil),
+               nil, "qwen vide + Apple absente → nil (clause JA seul)")
+    checkEqual(LiveClauseSelection.select(qwenJapanese: "  ", appleJapanese: "   "),
+               nil, "qwen vide + Apple vide → nil")
+    checkEqual(LiveClauseSelection.select(qwenJapanese: "   ", appleJapanese: "   "),
+               nil, "les deux vides → nil")
+
+    // CLI : --live-asr.
+    let live = try! CLIParser.parse(["mlxtranslate", "live", "--app", "VLC"])
+    checkEqual(live.liveASR, .qwenJA, "--live-asr absent → qwenja par défaut")
+    let liveVoxtral = try! CLIParser.parse(["mlxtranslate", "live", "--app", "VLC", "--live-asr", "voxtral"])
+    checkEqual(liveVoxtral.liveASR, .voxtralQ4, "--live-asr voxtral")
+    checkThrows(CLIParser.UnknownArgument.self, "--live-asr inconnu → UnknownArgument") {
+        _ = try CLIParser.parse(["mlxtranslate", "live", "--app", "VLC", "--live-asr", "whisper"])
+    }
+    checkThrows(CLIParser.UnknownArgument.self, "--live-asr sans valeur → UnknownArgument") {
+        _ = try CLIParser.parse(["mlxtranslate", "live", "--app", "VLC", "--live-asr"])
+    }
+}
+
+// MARK: - Modèles live (gated : MLXTRANSLATE_RUN_LIVE_MODELS=1)
+//
+// Charge Qwen3-ASR 1,7B JA + Qwen3-ForcedAligner (cache locaux), transcrit un
+// extrait du clip de test et vérifie la monotonie de l'alignement. Lent
+// (chargement des modèles) — activé seulement si l'env est posé :
+//   MLXTRANSLATE_RUN_LIVE_MODELS=1
+//   MLXTRANSLATE_LIVE_CLIP=<clip 16 kHz>  (défaut /tmp/test_ja.wav)
+
+private func runLiveModelsCheck() async {
+    guard ProcessInfo.processInfo.environment["MLXTRANSLATE_RUN_LIVE_MODELS"] != nil else {
+        print("[live-models] désactivé (MLXTRANSLATE_RUN_LIVE_MODELS=1 pour charger les modèles)")
+        return
+    }
+    let env = ProcessInfo.processInfo.environment
+    let clip = NSString(string: env["MLXTRANSLATE_LIVE_CLIP"] ?? "/tmp/test_ja.wav").expandingTildeInPath
+
+    // Extrait de 10 s au début du clip (WAV mono normalisé -1…1).
+    guard let audio = try? Audio.loadWAV(URL(fileURLWithPath: clip)) else {
+        check(false, "live-models : clip « \(clip) » lisible")
+        return
+    }
+    let excerpt = Array(audio.prefix(10 * 16_000))
+    check(excerpt.count == 10 * 16_000, "live-models : extrait de 10 s lu")
+
+    let asr = Qwen3ASRFinalRuntime()
+    do {
+        try await asr.prepare(progress: { _, _ in })
+        let asrPrepared = await asr.isPrepared
+        check(asrPrepared, "Qwen3-ASR 1.7B JA : préparé (chargement offline + warmup)")
+        let started = Date()
+        let text = try await asr.transcribe(audio: excerpt)
+        let elapsed = Date().timeIntervalSince(started)
+        print("[live-models] Qwen3-ASR : \(elapsed) s pour 10 s d'audio → « \(text.prefix(80)) »")
+        check(!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              "Qwen3-ASR : transcription non vide")
+
+        let aligner = Qwen3AlignerRuntime()
+        try await aligner.prepare(progress: { _, _ in })
+        let alignerPrepared = await aligner.isPrepared
+        check(alignerPrepared, "Qwen3-ForcedAligner : préparé (cache HF)")
+        let aligned = try await aligner.align(audio: excerpt, text: text)
+        print("[live-models] aligneur : \(aligned.count) mots")
+        for (i, w) in aligned.enumerated() {
+            print("  [\(i)] \(w.text)  start=\(String(format: "%.2f", w.startTime)) end=\(String(format: "%.2f", w.endTime))")
+        }
+        check(!aligned.isEmpty, "aligneur : au moins un mot aligné")
+        var monotone = true
+        var withinAudio = true
+        let audioSeconds = Float(excerpt.count) / 16_000
+        for (i, word) in aligned.enumerated() {
+            check(word.endTime >= word.startTime, "aligneur : intervalle non négatif (\(i))")
+            // L'aligneur peut placer le dernier mot légèrement au-delà de la fin
+            // de l'audio (estimation de la fin du mot) : tolérance d'1 s.
+            if word.startTime > audioSeconds + 1.0 { withinAudio = false }
+            if i > 0, word.startTime < aligned[i - 1].startTime - 0.08 { monotone = false }
+        }
+        check(monotone, "aligneur : timestamps monotones")
+        check(withinAudio, "aligneur : timestamps dans l'audio (≤ \(audioSeconds + 1.0) s)")
+    } catch {
+        check(false, "live-models : erreur (\(error))")
+    }
+}
+
 // MARK: - point d'entrée
 
 runSRTChecks()
@@ -311,7 +410,9 @@ runCLIParserChecks()
 runCleanLiveChecks()
 runDegradedChecks()
 runAudioSpoolChecks()
+runLiveFinalTierChecks()
 runGoldenCheck()
+await runLiveModelsCheck()
 
 print("[tests] \(checks) assertions, \(failures) échec(s)")
 if failures > 0 {

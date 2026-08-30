@@ -24,6 +24,7 @@ struct Command {
     var sansParlants: Bool = false
     // Live
     var app: String?
+    var liveASR: LiveFinalASR = .productDefault
     var liveDelay: VoxtralTranscriptionDelay = .milliseconds960
     var sansTraduction: Bool = false
     var livePreview: Bool = true
@@ -74,6 +75,7 @@ enum CLIParser {
                 --sans-traduction                      JA seul (pas de traduction EN finale)
                 --modele <id>                          modèle EN final (défaut : qwen3-8b)
                 --glossaire <chemin>                   glossaire de la traduction EN
+                --live-asr qwenja|voxtral              ASR final (défaut : qwenja, Qwen3-ASR 1,7B JA)
                 --delay 960|1200|2400                  latence Voxtral (défaut : 960)
                 --sortie <fichier>                     SRT live (défaut : ~/.mlxtranslate/live-<date>.srt)
                 --max N                                arrêt automatique après N secondes
@@ -97,6 +99,7 @@ enum CLIParser {
         var livePreview = true
         var liveOutput: URL?
         var maxSeconds: Double?
+        var liveASR = LiveFinalASR.productDefault
         var listApps = false
 
         var index = 1
@@ -150,6 +153,13 @@ enum CLIParser {
                 index += 1
             case "--list":
                 listApps = true
+            case "--live-asr":
+                guard index + 1 < arguments.count else { throw unknown("--live-asr sans valeur") }
+                guard let parsed = LiveFinalASR.cliValue(arguments[index + 1]) else {
+                    throw unknown("--live-asr doit être qwenja ou voxtral")
+                }
+                liveASR = parsed
+                index += 1
             case "--delay":
                 guard index + 1 < arguments.count,
                       let raw = Int(arguments[index + 1]),
@@ -196,6 +206,7 @@ enum CLIParser {
                 model: model,
                 glossary: glossary,
                 app: app,
+                liveASR: liveASR,
                 liveDelay: liveDelay,
                 sansTraduction: sansTraduction,
                 livePreview: livePreview,
