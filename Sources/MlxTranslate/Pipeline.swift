@@ -85,6 +85,12 @@ enum Pipeline {
             }
             Pipeline.log("nettoyer : \(liveSRTs.count) SRT live supprimé(s)")
         }
+        // Spool de rattrapage live (segments WAV tournés, 720 s).
+        let capturesDir = homeURL.appendingPathComponent("captures", isDirectory: true)
+        if fm.fileExists(atPath: capturesDir.path) {
+            try? fm.removeItem(at: capturesDir)
+            Pipeline.log("nettoyer : spool audio live (captures/) supprimé")
+        }
         Pipeline.log("nettoyer : terminé (modèles et glossaire conservés)")
     }
 

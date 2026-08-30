@@ -161,6 +161,10 @@ final class AppCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     /// boucle proprement au lieu de poller dans le vide.
     var onStreamFailure: (@Sendable (Error) -> Void)?
 
+    /// Writer WAV (spool de rattrapage, tourné toutes les 720 s). Accédé sur la file
+    /// de capture (sérialisé), pas de lock.
+    private var audioWriter: LiveAudioWriter?
+
     /// Applis capturables : ceux avec des fenêtres et une politique d'activation .regular.
     static func listApps() async throws -> [CaptureApp] {
         let content = try await AppCapture.shareableContent()
@@ -212,6 +216,12 @@ final class AppCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                 state.buffer.removeAll(keepingCapacity: true)
                 state.trimOffset = 0
             }
+            // Writer WAV (spool de rattrapage, tourné toutes les 720 s).
+            let baseTs = Int(Date().timeIntervalSince1970)
+            let capturesDir = Pipeline.homeURL.appendingPathComponent("captures")
+            try? FileManager.default.createDirectory(at: capturesDir, withIntermediateDirectories: true)
+            let baseURL = capturesDir.appendingPathComponent("live-\(baseTs)")
+            audioWriter = LiveAudioWriter(baseURL: baseURL, sampleRate: 16_000, rotationSeconds: 720)
         }
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
@@ -227,6 +237,9 @@ final class AppCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         captureQueue.sync {
             // Draine la queue retardée du résampleur en fin de flux.
             _ = resampler.finish()
+            // Finalise le segment WAV courant (récupérable).
+            audioWriter?.finish()
+            audioWriter = nil
         }
         try? await stream?.stopCapture()
         stream = nil
@@ -257,6 +270,8 @@ final class AppCapture: NSObject, SCStreamOutput, SCStreamDelegate {
             bufLock.withLock { state in
                 state.buffer.append(contentsOf: resampled)
             }
+            // Spool de rattrapage : écriture WAV (tournée toutes les 720 s).
+            audioWriter?.append(resampled)
         }
     }
 

@@ -83,6 +83,16 @@ Options live :
 L'endpointing découpe sur une pause (silence 300 ms), avec coupure forcée à
 12 s par énoncé ; la session de capture est réinitialisée toutes les 12 min.
 
+**Spool de capture** — l'audio capturé (16 kHz mono, Float32) est aussi écrit
+en spool WAV (`~/.mlxtranslate/captures/live-<horodatage>/`), **tourné toutes les
+720 s** (12 min) : chaque segment `live-NNN.wav` est un fichier WAV valide
+(l'en-tête est mis à jour à chaque rotation et à l'arrêt). C'est le mécanisme de
+**rattrapage** : en cas de panne du mode live, l'audio capturé reste récupérable
+dans le dernier segment (les données PCM sont écrites au fur et à mesure). Pour
+un conteneur compressé (m4a/AAC), convertir avec
+`ffmpeg -i live-NNN.wav -c:a aac live-NNN.m4a`. La commande `nettoyer` vide
+`captures/` en plus de `runs/` et des `live-*.srt`.
+
 ## Origine des runtimes
 
 Les runtimes de `Sources/MlxTranslate/Runtime` sont issus du dépôt
@@ -113,6 +123,7 @@ swift-huggingface 0.9.0, swift-transformers 1.3.3.
   sidecar/               runtime Python Voxtral (uv, venv, modèles)
   glossaire.txt          glossaire de traduction
   live-<horodatage>.srt  SRT du mode live (par défaut)
+  captures/live-<horodatage>/  spool WAV du mode live (16 kHz, tourné 720 s)
 ```
 
 Les SRT offline sont écrits **côte à côte de la vidéo** :

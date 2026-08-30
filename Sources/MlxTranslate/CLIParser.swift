@@ -47,8 +47,8 @@ enum CLIParser {
               traduire    traduction EN, écrit « <nom> (EN).srt »
               finale      chaîne complète (ASR → alignement → parlants → traduction)
               live        sous-titres EN temps réel de l'audio d'une application (JA)
-              nettoyer    nettoie les sessions ~/.mlxtranslate (runs, live-*.srt),
-                          garde les modèles et le glossaire
+              nettoyer    nettoie les sessions ~/.mlxtranslate (runs, live-*.srt,
+                          captures/), garde les modèles et le glossaire
               aider       cette aide
 
             Options :

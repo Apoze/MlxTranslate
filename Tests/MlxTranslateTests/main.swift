@@ -239,12 +239,48 @@ private func runDegradedChecks() {
     check(SRT.containsJapanese("はい"), "dialogue : détecte le japonais")
 }
 
+// MARK: - Spool de rattrapage live (writer WAV tourné, 720 s)
+
+private func runAudioSpoolChecks() {
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mlxtest-spool-\(ProcessInfo.processInfo.processIdentifier)")
+    try? FileManager.default.removeItem(at: tmp)
+    try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    let base = tmp.appendingPathComponent("live-test")
+    // Rotation 1 s (16 000 échantillons à 16 kHz) pour tester la rotation sans attendre.
+    let writer = LiveAudioWriter(baseURL: base, sampleRate: 16_000, rotationSeconds: 1)
+    // 4 batches de 5 000 échantillons = 20 000 au total (1,25 s) → 1 rotation.
+    for _ in 0..<4 {
+        writer.append(Array(repeating: 0.5, count: 5_000))
+    }
+    writer.finish()
+    let seg0 = base.appendingPathComponent("live-000.wav")
+    let seg1 = base.appendingPathComponent("live-001.wav")
+    check(FileManager.default.fileExists(atPath: seg0.path), "spool : segment 0 existe")
+    check(FileManager.default.fileExists(atPath: seg1.path), "spool : rotation a créé le segment 1")
+    if let data = try? Data(contentsOf: seg0) {
+        check(data.count >= 44, "spool : fichier ≥ 44 octets (en-tête WAV)")
+        if data.count >= 44 {
+            checkEqual(String(decoding: data[0..<4], as: UTF8.self), "RIFF", "spool : magic RIFF")
+            checkEqual(String(decoding: data[8..<12], as: UTF8.self), "WAVE", "spool : magic WAVE")
+            // Taille du chunk data (offset 40..43, little-endian) = 20 000 échantillons * 4.
+            let dataSize = Int(data[40]) | (Int(data[41]) << 8) | (Int(data[42]) << 16) | (Int(data[43]) << 24)
+            checkEqual(dataSize, 20_000 * 4, "spool : taille data segment 0")
+            checkEqual(data.count, 44 + 20_000 * 4, "spool : taille fichier segment 0")
+        }
+    } else {
+        check(false, "spool : segment 0 lisible")
+    }
+    try? FileManager.default.removeItem(at: tmp)
+}
+
 // MARK: - point d'entrée
 
 runSRTChecks()
 runEndpointingChecks()
 runCLIParserChecks()
 runDegradedChecks()
+runAudioSpoolChecks()
 runGoldenCheck()
 
 print("[tests] \(checks) assertions, \(failures) échec(s)")
