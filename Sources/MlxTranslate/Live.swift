@@ -104,6 +104,9 @@ final class LivePreviewTask: @unchecked Sendable {
     private let stopLock = OSAllocatedUnfairLock(initialState: false)
     private let jaLock = NSLock()
     private var rollingJA = ""
+    /// Début (échantillons 16 kHz) de l'énoncé en cours — mis à jour par le
+    /// moteur live après chaque commit ; sert d'horodatage aux previews.
+    var committedSampleOffset = 0
 
     init(capture: AppCapture, speech: AppleSpeechService, translation: AppleTranslationService, output: LiveOutput) {
         self.capture = capture
@@ -140,6 +143,9 @@ final class LivePreviewTask: @unchecked Sendable {
     }
 
     // Traduction throttlée (≥ 0,7 s et texte changé) du texte roulant → EN bas.
+    // L'horodatage affiché est le DÉBUT de l'énoncé en cours (aligné sur le
+    // final/SRT), pas la position courante : les previews et les cues SRT
+    // utilisent alors la même base temporelle.
     private func renderPreview() async {
         let ja = jaLock.withLock { rollingJA }
         guard ja != lastTranslatedJA,
@@ -150,8 +156,10 @@ final class LivePreviewTask: @unchecked Sendable {
             let now = Date()
             jaLock.withLock { lastTranslatedJA = ja }
             lastTranslateTime = now
-            let clock = LiveFormat.clock(Double(capture.sampleCount()) / LiveEndpointing.sampleRate)
-            await output.showPreview("\(clock) ~ \(en)")
+            // Début de l'énoncé en cours ≈ dernier commit (0 sinon).
+            let utteranceStart = Double(committedSampleOffset) / LiveEndpointing.sampleRate
+            let timecode = LiveFormat.timecode(utteranceStart)
+            await output.showPreview("\(timecode) ~ \(en)")
         } catch { /* best-effort */ }
     }
 
@@ -403,6 +411,7 @@ struct LiveEngine: Sendable {
             )
 
             lastCommit = cut
+            previewTask?.committedSampleOffset = lastCommit
             if lastCommit >= Int(120 * LiveEndpointing.sampleRate) {
                 capture.trim(upTo: lastCommit)
             }
