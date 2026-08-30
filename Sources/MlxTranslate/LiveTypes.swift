@@ -26,6 +26,27 @@ enum LiveEndpointing {
     static let pollSeconds = 0.4
     /// Résolution de l'échantillon (16 kHz).
     static let sampleRate = 16_000.0
+
+    /// Index (dans `silenceFrames`) du DÉBUT de la dernière séquence de silence
+    /// (≥ `minSilence` frames), si au moins une frame de parole la précède ; sinon nil.
+    /// `silenceFrames[i] == 1` si la frame `i` est silencieuse. Fonction pure testable.
+    static func lastSilenceRunStart(silenceFrames: [Int], minSilence: Int) -> Int? {
+        var i = silenceFrames.count
+        while i > 0 {
+            i -= 1
+            if silenceFrames[i] == 1 {
+                var runStart = i
+                while runStart > 0, silenceFrames[runStart - 1] == 1 {
+                    runStart -= 1
+                }
+                let runLength = i - runStart + 1
+                if runStart > 0 {
+                    return runLength >= minSilence ? runStart : nil
+                }
+            }
+        }
+        return nil
+    }
 }
 
 enum LiveFormat {

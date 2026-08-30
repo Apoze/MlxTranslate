@@ -13,7 +13,8 @@ let package = Package(
     name: "MlxTranslate",
     platforms: [.macOS("15.0")],
     products: [
-        .executable(name: "mlxtranslate", targets: ["MlxTranslate"]),
+        .executable(name: "mlxtranslate", targets: ["MlxTranslateCLI"]),
+        .executable(name: "mlxtranslatetests", targets: ["MlxTranslateTests"]),
     ],
     traits: [
         // Génère le bundle de ressources (Bundle.module) pour la cible.
@@ -29,7 +30,9 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.3.3"),
     ],
     targets: [
-        .executableTarget(
+        // Bibliothèque : pipeline (SRT, CLIParser, Live, ASR, ...) — pas de point
+        // d'entrée (`@main`), pour pouvoir être dépendante sans double `__main`.
+        .target(
             name: "MlxTranslate",
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
@@ -46,12 +49,29 @@ let package = Package(
             resources: [
                 .copy("Runtime/VoxtralHelper"),
             ],
+            // Permet `@testable import MlxTranslate` (le CLI + le test runner
+            // accèdent aux types internes SRT / CLIParser / LiveEndpointing / Command).
+            swiftSettings: [.unsafeFlags(["-enable-testing"])],
             linkerSettings: [
                 .linkedFramework("Metal"),
                 .linkedFramework("Accelerate"),
                 .linkedLibrary("c++"),
                 .linkedFramework("Foundation"),
             ]
+        ),
+        // Point d'entrée du CLI (`@main`) : une fine couche sur la bibliothèque.
+        .executableTarget(
+            name: "MlxTranslateCLI",
+            dependencies: ["MlxTranslate"],
+            path: "Sources/MlxTranslateCLI"
+        ),
+        // Suite de tests autoportante (rapides : SRT, CLI, endpointing) — une cible
+        // exécutable, pas de framework XCTest / swift-testing (absent du toolchain CLT).
+        // Lancement : `swift run mlxtranslatetests` (sort 0 si vert, 1 sinon).
+        .executableTarget(
+            name: "MlxTranslateTests",
+            dependencies: ["MlxTranslate"],
+            path: "Tests/MlxTranslateTests"
         ),
     ],
     swiftLanguageModes: [.v5],

@@ -255,14 +255,22 @@ struct LiveEngine: Sendable {
             throw LiveError.appNotFound(configuration.app)
         }
 
+        // Lock d'arrêt partagé (SIGINT, --max, échec du flux SCK) — créé AVANT la
+        // capture pour que le callback d'échec couvre aussi la fenêtre de setup.
+        let stopLock = OSAllocatedUnfairLock(initialState: false)
+
         let capture = AppCapture()
+        // Si le flux SCK échoue en cours (app fermée, TCC révoquée, écran déconnecté),
+        // on arrête la boucle pour finaliser ce qui reste au lieu de poller dans le vide.
+        capture.onStreamFailure = { _ in
+            stopLock.withLock { $0 = true }
+        }
         try await capture.start(app: match.running)
         Pipeline.log("capture démarrée : \(match.name)")
 
         let output = LiveOutput(fileURL: configuration.outputURL)
 
-        // Timer d'arrêt (--max) + arrêt SIGINT, comptés depuis le début de la capture.
-        let stopLock = OSAllocatedUnfairLock(initialState: false)
+        // Timer d'arrêt (--max), compté depuis le début de la capture.
         var maxTask: Task<Void, Never>?
         if let maxSeconds = configuration.maxSeconds {
             maxTask = Task {

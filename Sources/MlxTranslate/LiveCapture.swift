@@ -156,6 +156,11 @@ final class AppCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private var running = false
 
+    /// Callback (thread-safe) appelé si le flux SCK échoue en cours (app fermée,
+    /// TCC révoquée, écran déconnecté). Le live engine s'en sert pour arrêter la
+    /// boucle proprement au lieu de poller dans le vide.
+    var onStreamFailure: (@Sendable (Error) -> Void)?
+
     /// Applis capturables : ceux avec des fenêtres et une politique d'activation .regular.
     static func listApps() async throws -> [CaptureApp] {
         let content = try await AppCapture.shareableContent()
@@ -255,6 +260,15 @@ final class AppCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    // MARK: SCStreamDelegate
+
+    /// Le flux SCK a échoué (app fermée, TCC révoquée, écran déconnecté, …).
+    /// On notifie le live engine pour qu'il arrête la boucle proprement.
+    func streamDidFailWithError(_ stream: SCStream, error: Error, for output: SCStreamOutput?) {
+        Pipeline.log("capture : échec du flux SCK (\(error.localizedDescription))")
+        onStreamFailure?(error)
+    }
+
     // MARK: Tampon 16 kHz (lectures)
 
     /// Nombre total d'échantillons 16 kHz accumulés (index absolu).
@@ -313,28 +327,11 @@ final class AppCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                 frameStarts.append(silent ? 1 : 0)
                 frameStart += frameSamples
             }
-            var i = frameStarts.count
-            while i > 0 {
-                i -= 1
-                if frameStarts[i] == 1 {
-                    // Trouve le début de la séquence de silence.
-                    var runStart = i
-                    while runStart > 0, frameStarts[runStart - 1] == 1 {
-                        runStart -= 1
-                    }
-                    let runLength = i - runStart + 1
-                    // Une frame de parole doit précéder la séquence.
-                    if runStart > 0 {
-                        let cutSample = (from - state.trimOffset) + runStart * frameSamples
-                        _ = cutSample
-                        // Index absolu au début de la séquence de silence.
-                        let absolute = (from - state.trimOffset) + runStart * frameSamples + state.trimOffset
-                        _ = (i - runStart + 1)
-                        return runLength >= minSilence ? absolute : nil
-                    }
-                }
-            }
-            return nil
+            guard let runStart = LiveEndpointing.lastSilenceRunStart(
+                silenceFrames: frameStarts, minSilence: minSilence
+            ) else { return nil }
+            // Index absolu au début de la séquence de silence.
+            return (from - state.trimOffset) + runStart * frameSamples + state.trimOffset
         }
     }
 
