@@ -10,6 +10,7 @@ struct Command {
         case traduire = "traduire"
         case finale = "finale"
         case live = "live"
+        case nettoyer = "nettoyer"
     }
 
     var verb: Verb
@@ -46,6 +47,8 @@ enum CLIParser {
               traduire    traduction EN, écrit « <nom> (EN).srt »
               finale      chaîne complète (ASR → alignement → parlants → traduction)
               live        sous-titres EN temps réel de l'audio d'une application (JA)
+              nettoyer    nettoie les sessions ~/.mlxtranslate (runs, live-*.srt),
+                          garde les modèles et le glossaire
               aider       cette aide
 
             Options :
@@ -102,7 +105,7 @@ enum CLIParser {
             switch argument {
             case "aider", "-h", "--help":
                 throw Help()
-            case "transcrire", "aligner", "parlants", "traduire", "finale", "live":
+            case "transcrire", "aligner", "parlants", "traduire", "finale", "live", "nettoyer":
                 guard verb == nil else { throw unknown("commande en double : \(argument)") }
                 verb = Command.Verb(rawValue: argument)
             case "--asr":
@@ -200,6 +203,11 @@ enum CLIParser {
                 maxSeconds: maxSeconds,
                 listApps: listApps
             )
+        }
+        if selectedVerb == .nettoyer {
+            // `nettoyer` n'a pas de média : nettoie les sessions, garde les modèles.
+            let videoURL = video ?? URL(fileURLWithPath: "nettoyer")
+            return Command(verb: .nettoyer, video: videoURL)
         }
         guard let selectedVideo = video else {
             throw Help()

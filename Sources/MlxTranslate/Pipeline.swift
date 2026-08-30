@@ -68,6 +68,26 @@ enum Pipeline {
         return run
     }
 
+    /// `nettoyer` : retire les sessions (runs/ et live-*.srt) mais garde les
+    /// modèles (mlx.metallib, speakerkit, sidecar) et le glossaire.
+    static func nettoyer() throws {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: runsDirectory.path) {
+            try fm.removeItem(at: runsDirectory)
+            Pipeline.log("nettoyer : sessions (runs/) supprimées")
+        } else {
+            Pipeline.log("nettoyer : rien à supprimer dans runs/")
+        }
+        if let files = try? fm.contentsOfDirectory(at: homeURL, includingPropertiesForKeys: nil) {
+            let liveSRTs = files.filter { $0.lastPathComponent.hasPrefix("live-") && $0.lastPathComponent.hasSuffix(".srt") }
+            for file in liveSRTs {
+                try? fm.removeItem(at: file)
+            }
+            Pipeline.log("nettoyer : \(liveSRTs.count) SRT live supprimé(s)")
+        }
+        Pipeline.log("nettoyer : terminé (modèles et glossaire conservés)")
+    }
+
     /// Plus récent run contenant un chunks.json pour ce média.
     static func findLatestRun(for video: URL) -> URL? {
         guard let entries = try? FileManager.default.contentsOfDirectory(
@@ -203,6 +223,10 @@ enum Pipeline {
             }
             return
         }
+        if command.verb == .nettoyer {
+            try nettoyer()
+            return
+        }
         guard FileManager.default.fileExists(atPath: command.video.path) else {
             throw PipelineError.mediaNotFound(command.video.path)
         }
@@ -221,6 +245,9 @@ enum Pipeline {
         case .finale:
             try await finale(command)
         case .live:
+            // Inatteignable (géré ci-dessus) ; exhaustivité du switch.
+            break
+        case .nettoyer:
             // Inatteignable (géré ci-dessus) ; exhaustivité du switch.
             break
         }
