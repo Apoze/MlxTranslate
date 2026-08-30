@@ -261,6 +261,16 @@ struct LiveEngine: Sendable {
 
         let output = LiveOutput(fileURL: configuration.outputURL)
 
+        // Timer d'arrêt (--max) + arrêt SIGINT, comptés depuis le début de la capture.
+        let stopLock = OSAllocatedUnfairLock(initialState: false)
+        var maxTask: Task<Void, Never>?
+        if let maxSeconds = configuration.maxSeconds {
+            maxTask = Task {
+                try? await Task.sleep(for: .seconds(maxSeconds))
+                stopLock.withLock { $0 = true }
+            }
+        }
+
         var previewTask: LivePreviewTask?
         let speech = AppleSpeechService()
         let translation = AppleTranslationService()
@@ -304,21 +314,12 @@ struct LiveEngine: Sendable {
         // --- Boucle d'endpointing + finalisation ---------------------------
         var lastCommit = 0
         var stopRequested = false
-        let stopLock = OSAllocatedUnfairLock(initialState: false)
 
         let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         source.setEventHandler {
             stopLock.withLock { $0 = true }
         }
         source.resume()
-
-        var maxTask: Task<Void, Never>?
-        if let maxSeconds = configuration.maxSeconds {
-            maxTask = Task {
-                try? await Task.sleep(for: .seconds(maxSeconds))
-                stopLock.withLock { $0 = true }
-            }
-        }
 
         while !stopRequested {
             try? await Task.sleep(for: .seconds(LiveEndpointing.pollSeconds))
@@ -332,12 +333,15 @@ struct LiveEngine: Sendable {
                 from: lastCommit + LiveEndpointing.minSilenceFrames * LiveEndpointing.frameSamples,
                 upTo: available
             )
-            // Forçage : énoncé trop long sans pause → coupe à la durée max.
+            // Forçage : si 12 s s'accumulent sans pause, on coupe à 12 s ; sinon on
+            // coupe à la pause (silence) si elle tombe avant 12 s.
             let maxEnd = lastCommit + Int(LiveEndpointing.forceCutSeconds * LiveEndpointing.sampleRate)
-            if let candidate = cut, candidate - lastCommit > maxEnd {
+            if let s = cut {
+                cut = min(s, maxEnd)
+            } else if available >= maxEnd {
                 cut = maxEnd
             }
-            guard let cut, cut - lastCommit >= Int(0.5 * LiveEndpointing.sampleRate) else { continue }
+            guard let cut = cut, cut - lastCommit >= Int(0.5 * LiveEndpointing.sampleRate) else { continue }
 
             let utteranceAudio = capture.samples(from: lastCommit, upTo: cut)
             let startSeconds = Double(lastCommit) / LiveEndpointing.sampleRate
