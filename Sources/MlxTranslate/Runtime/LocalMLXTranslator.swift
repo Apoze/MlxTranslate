@@ -364,6 +364,8 @@ actor LocalMLXTranslator {
     func translateLive(
         japanese: String,
         glossary: [HighQualityGlossaryPromptTerm],
+        history: [HighQualityAcceptedTranslationPair] = [],
+        isFragment: Bool = false,
         sourceStart: Double? = nil,
         sourceEnd: Double? = nil,
         onChunk: @escaping @Sendable (String) -> Void = { _ in }
@@ -400,7 +402,27 @@ actor LocalMLXTranslator {
         messages += pairs.flatMap { source, target in
             [qwenUserMessage(source), ["role": "assistant", "content": target]]
         }
-        messages.append(qwenUserMessage(Self.contextText(for: turn)))
+        // Contexte roulant : les clauses commises précédentes (JA → EN, K=4
+        // max) préservent le registre, la terminologie et les propres noms
+        // d'une clause à l'autre (sans cela chaque clause est isolée et le
+        // registre saute).
+        let recent = history.suffix(4)
+        messages += recent.flatMap { pair in
+            [qwenUserMessage(pair.japanese), ["role": "assistant", "content": pair.english]]
+        }
+        var contextText = Self.contextText(for: turn)
+        if isFragment {
+            // Clause incomplète (silence forcé) : on traduit ce qui est là,
+            // sous une forme en cours naturelle, sans compléter ni deviner.
+            contextText += """
+
+
+            NOTE: the source text is an incomplete fragment (the speaker has not \
+            finished this clause). Translate only what is present, in a natural \
+            in-progress form; do not complete or speculate.
+            """
+        }
+        messages.append(qwenUserMessage(contextText))
         let parameters = Self.generationParameters
         let input = try await container.prepare(
             input: UserInput(prompt: .messages(messages), additionalContext: ["enable_thinking": false])

@@ -252,6 +252,9 @@ struct LiveEngineConfiguration: Sendable {
     var outputURL: URL
     var maxSeconds: Double?
     var show: Bool = true
+    /// Niveau final ASR : `qwenJA` (défaut produit, endpointing sémantique
+    /// Qwen3-ASR + aligneur) ou `voxtralQ4` (legacy).
+    var liveASR: LiveFinalASR = LiveFinalASR.productDefault
     // Callback de superposition : le texte EN courant (preview en streaming, puis final
     // engagé) + un flag « estFinal ». Sert à alimenter une barre de sous-titres GUI
     // (l'outil CLI renvoie nil → pas de superposition).
@@ -269,11 +272,14 @@ struct LiveEngineConfiguration: Sendable {
 enum LiveError: LocalizedError {
     case appNotFound(String)
     case sidecar(String)
+    /// Préparation du niveau final Qwen3-ASR (ASR finale + aligneur) en échec.
+    case finalASR(String)
 
     var errorDescription: String? {
         switch self {
         case .appNotFound(let detail): "application introuvable : \(detail) (utilisez `live --list`)"
         case .sidecar(let detail): "Voxtral sidecar : \(detail)"
+        case .finalASR(let detail): "niveau final Qwen3-ASR : \(detail)"
         }
     }
 }
@@ -312,7 +318,8 @@ enum Live {
             delay: command.liveDelay,
             sansTraduction: command.sansTraduction,
             outputURL: outputURL,
-            maxSeconds: command.maxSeconds
+            maxSeconds: command.maxSeconds,
+            liveASR: command.liveASR
         )
         try await LiveEngine(configuration: config).run()
     }
@@ -407,14 +414,51 @@ struct LiveEngine: Sendable {
             }
         }
 
-        let sidecar = VoxtralHelperRuntime(rootDirectory: ASR.sidecarRoot)
-        let sidecarConfig = VoxtralContinuousConfiguration(model: .q4, delay: configuration.delay)
-        do {
-            try await sidecar.prepare(configuration: sidecarConfig)
-        } catch {
-            await capture.stop()
-            await previewTask?.finish()
-            throw LiveError.sidecar(error.localizedDescription)
+        let useQwenFinal = configuration.liveASR == .qwenJA
+        // Legacy Voxtral : sidecar Python (seulement en mode voxtralQ4 — le
+        // mode produit (qwenJA) charge Qwen3-ASR + aligneur en MLX, ~12 GB
+        // résidents au lieu de Voxtral + Qwen).
+        let sidecar: VoxtralHelperRuntime?
+        if useQwenFinal {
+            sidecar = nil
+        } else {
+            let helper = VoxtralHelperRuntime(rootDirectory: ASR.sidecarRoot)
+            let sidecarConfig = VoxtralContinuousConfiguration(model: .q4, delay: configuration.delay)
+            do {
+                try await helper.prepare(configuration: sidecarConfig)
+            } catch {
+                await capture.stop()
+                await previewTask?.finish()
+                throw LiveError.sidecar(error.localizedDescription)
+            }
+            sidecar = helper
+        }
+
+        // Niveau final Qwen3-ASR (défaut produit) : transcribeur 1.7B JA
+        // (snapshot) + aligneur de mots (borne exacte de chaque clause,
+        // zéro dérive).
+        var asrFinal: Qwen3ASRFinalRuntime?
+        var alignerRT: Qwen3AlignerRuntime?
+        if useQwenFinal {
+            let final = Qwen3ASRFinalRuntime()
+            do {
+                try await final.prepare(progress: { _, message in Pipeline.log(message) })
+            } catch {
+                await capture.stop()
+                await previewTask?.finish()
+                throw LiveError.finalASR(error.localizedDescription)
+            }
+            let aligner = Qwen3AlignerRuntime()
+            do {
+                try await aligner.prepare(progress: { _, message in Pipeline.log(message) })
+            } catch {
+                await final.unload()
+                await capture.stop()
+                await previewTask?.finish()
+                throw LiveError.finalASR(error.localizedDescription)
+            }
+            asrFinal = final
+            alignerRT = aligner
         }
 
         let translator = LocalMLXTranslator(candidate: configuration.model)
@@ -428,6 +472,15 @@ struct LiveEngine: Sendable {
         // --- Boucle d'endpointing + finalisation ---------------------------
         var lastCommit = 0
         var stopRequested = false
+        // État roulant de l'endpointing sémantique (mode Qwen3-ASR) :
+        // snapshot cumulatif (cadence 2 s), suivi de stabilité, historique
+        // LLM roulant (paires JA→EN, K=4) et contexte ASR roulant (JA récent).
+        var snapshot = ""
+        var lastSnapshotAt = Date.distantPast
+        var lastSnapshotThrough = 0
+        var stabilityTracker = SnapshotStabilityTracker()
+        var history: [HighQualityAcceptedTranslationPair] = []
+        var committedJA = ""
 
         let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         source.setEventHandler {
@@ -440,7 +493,169 @@ struct LiveEngine: Sendable {
             if stopLock.withLock({ $0 }) || configuration.stopRequested() { stopRequested = true; break }
 
             let available = capture.sampleCount()
-            guard available >= LiveEndpointing.minSilenceFrames * LiveEndpointing.frameSamples else { continue }
+
+            if useQwenFinal, let asrFinal, let alignerRT {
+                // --- Endpointing sémantique (Qwen3-ASR final + aligneur) ---
+                guard available - lastCommit >= Int(0.5 * LiveEndpointing.sampleRate) else { continue }
+
+                // 1) Snapshot : silence de fin ≥ 0,3 s déclenche une évaluation ;
+                //    la sortie du modèle (Qwen3-ASR, fenêtre entière depuis le
+                //    dernier commit, cadence 2 s, plus récent gagne) en décide.
+                let tail = capture.samples(
+                    from: max(lastCommit, available - Int(LiveSemanticEndpointer.forceCutSeconds * LiveEndpointing.sampleRate)),
+                    upTo: available
+                )
+                let silenceSeconds = LiveSemanticEndpointer.trailingSilenceSeconds(tail)
+                let cadenceDue =
+                    Date().timeIntervalSince(lastSnapshotAt) >= LiveSemanticEndpointer.snapshotCadenceSeconds
+                        && available - lastCommit >= Int(LiveSemanticEndpointer.snapshotCadenceSeconds * LiveEndpointing.sampleRate)
+                let staleAtTrigger =
+                    silenceSeconds >= LiveSemanticEndpointer.triggerSilenceSeconds
+                        && available - lastSnapshotThrough >= Int(0.5 * LiveEndpointing.sampleRate)
+                if cadenceDue || staleAtTrigger {
+                    lastSnapshotAt = Date()
+                    lastSnapshotThrough = available
+                    let windowAudio = capture.samples(from: lastCommit, upTo: available)
+                    let asrContext = String(committedJA.suffix(LiveSemanticEndpointer.asrContextCharacters))
+                    do {
+                        let asrStarted = Date()
+                        snapshot = try await asrFinal.transcribe(
+                            audio: windowAudio,
+                            context: asrContext.isEmpty ? nil : asrContext
+                        )
+                        LiveDebug.log(
+                            "ASR(Qwen3) snapshot \"\(snapshot)\" "
+                            + "(\(String(format: "%.0f", Date().timeIntervalSince(asrStarted) * 1000)) ms, "
+                            + "\(String(format: "%.1f", Double(windowAudio.count) / 16000.0)) s d'audio)"
+                        )
+                    } catch {
+                        Pipeline.log("snapshot Qwen3-ASR en échec : \(error.localizedDescription)")
+                        LiveDebug.log("ASR(Qwen3) snapshot en échec : \(error.localizedDescription)")
+                    }
+                }
+
+                // 2) Déclenchement : silence de fin ≥ 0,3 s (sinon on attend).
+                guard silenceSeconds >= LiveSemanticEndpointer.triggerSilenceSeconds else { continue }
+
+                // 3) Verdict sémantique : fin de phrase + stabilité (pas de
+                //    fenêtre temporelle fixe) ; 2 s de silence sur clause
+                //    incomplète → fragment ; 12 s → filet de sécurité.
+                let stable = stabilityTracker.observe(snapshot)
+                let terminal = LiveSemanticEndpointer.isTerminalJapanese(snapshot)
+                let windowSeconds = Double(available - lastCommit) / LiveEndpointing.sampleRate
+                let decision = LiveSemanticEndpointer.evaluate(
+                    silenceSeconds: silenceSeconds,
+                    isTerminal: terminal,
+                    isStable: stable,
+                    windowSeconds: windowSeconds
+                )
+                guard decision != .hold else { continue }
+
+                // Garde des vides : jamais de clause vide au LLM.
+                guard let jaText = LiveClauseSelection.select(qwenJapanese: snapshot, appleJapanese: nil) else {
+                    continue
+                }
+
+                // 4) Alignement : borne exacte de consommation (zéro dérive) —
+                //    la fenêtre suivante démarre à la fin du dernier mot.
+                //    Repli : fedThrough − garde de stabilité (1,12 s).
+                let windowAudio = capture.samples(from: lastCommit, upTo: available)
+                var nextCommit = max(
+                    lastCommit,
+                    available - Int(LiveSemanticEndpointer.stabilityGuardSeconds * LiveEndpointing.sampleRate)
+                )
+                if let aligned = try? await alignerRT.align(audio: windowAudio, text: jaText),
+                   let lastWord = aligned.last, lastWord.startTime > 0 {
+                    nextCommit = min(
+                        max(lastCommit + Int(lastWord.endTime * Float(LiveEndpointing.sampleRate)), lastCommit),
+                        available
+                    )
+                }
+                if nextCommit <= lastCommit { nextCommit = available }
+                LiveDebug.log(
+                    "ENDPOINTING(qwen) \(decision) silence=\(String(format: "%.1f", silenceSeconds)) s "
+                    + "terminal=\(terminal) stable=\(stable) "
+                    + "→ commit [\(String(format: "%.1f", Double(lastCommit) / LiveEndpointing.sampleRate))"
+                    + "–\(String(format: "%.1f", Double(nextCommit) / LiveEndpointing.sampleRate)) s] "
+                    + "JA=\"\(jaText)\""
+                )
+
+                // 5) Traduction (historique roulant + glossaire, streaming).
+                var enText: String?
+                let windowStartSeconds = Double(lastCommit) / LiveEndpointing.sampleRate
+                if !configuration.sansTraduction {
+                    do {
+                        let translateStarted = Date()
+                        let chunkCounter = OSAllocatedUnfairLock(initialState: 0)
+                        enText = try await translator.translateLive(
+                            japanese: jaText,
+                            glossary: glossary,
+                            history: Array(history.suffix(LiveSemanticEndpointer.historyLimit)),
+                            isFragment: decision == .commitFragment,
+                            sourceStart: windowStartSeconds,
+                            sourceEnd: Double(nextCommit) / LiveEndpointing.sampleRate,
+                            onChunk: { chunk in
+                                if !chunk.isEmpty {
+                                    let n = chunkCounter.withLock { $0 += 1; return $0 }
+                                    LiveDebug.log("MLX chunk #\(n) (preview cumulée) = \"\(chunk)\"")
+                                    configuration.onLine?(chunk, false)
+                                    Task {
+                                        await output.showPreview(
+                                            "\(LiveFormat.timecode(windowStartSeconds)) ~ \(chunk)"
+                                        )
+                                    }
+                                }
+                            }
+                        )
+                        if enText?.isEmpty == true { enText = nil }
+                        let chunkTotal = chunkCounter.withLock { $0 }
+                        LiveDebug.log(
+                            "TRAD(MLX) FINAL EN=\"\(enText ?? "")\" "
+                            + "(\(String(format: "%.0f", Date().timeIntervalSince(translateStarted) * 1000)) ms, \(chunkTotal) chunks)"
+                        )
+                    } catch {
+                        Pipeline.log("traduction EN en échec : \(error.localizedDescription)")
+                        LiveDebug.log("TRAD(MLX) échec : \(error.localizedDescription)")
+                    }
+                }
+
+                // 6) Engagement + état roulant (historique LLM, contexte ASR,
+                //    stabilité réinitialisée, fenêtre avancée à la borne alignée).
+                let finalEN = enText ?? (configuration.sansTraduction ? jaText : "")
+                await output.clearPreview()
+                await output.commit(
+                    start: Double(lastCommit) / LiveEndpointing.sampleRate,
+                    end: Double(nextCommit) / LiveEndpointing.sampleRate,
+                    japanese: jaText,
+                    english: enText,
+                    show: configuration.show
+                )
+                if !finalEN.isEmpty {
+                    LiveDebug.log("FINAL onLine isFinal=true EN=\"\(finalEN)\"")
+                    configuration.onLine?(finalEN, true)
+                }
+                history.append(HighQualityAcceptedTranslationPair(
+                    cueID: "live-\(history.count)",
+                    japanese: jaText,
+                    english: finalEN.isEmpty ? jaText : finalEN
+                ))
+                history = Array(history.suffix(LiveSemanticEndpointer.historyLimit))
+                committedJA += " \(jaText)"
+                lastCommit = nextCommit
+                stabilityTracker.reset()
+                snapshot = ""
+                lastSnapshotAt = .distantPast
+                lastSnapshotThrough = 0
+                previewTask?.committedSampleOffset = lastCommit
+                if lastCommit >= Int(120 * LiveEndpointing.sampleRate) {
+                    capture.trim(upTo: lastCommit)
+                }
+                continue
+            }
+
+            // --- Legacy Voxtral : coupe au silence + forçage 12 s ---
+            guard let sidecar,
+                  available >= LiveEndpointing.minSilenceFrames * LiveEndpointing.frameSamples else { continue }
 
             // Trouve la pause (début de silence ≥ minSilenceFrames) après lastCommit.
             var cut = capture.lastSilenceCut(
@@ -524,7 +739,41 @@ struct LiveEngine: Sendable {
 
         // --- Finalisation de l'audio restant --------------------------------
         let remaining = capture.sampleCount()
-        if remaining - lastCommit >= Int(0.5 * LiveEndpointing.sampleRate) {
+        if useQwenFinal, let asrFinal {
+            if remaining - lastCommit >= Int(0.5 * LiveEndpointing.sampleRate) {
+                let windowAudio = capture.samples(from: lastCommit, upTo: remaining)
+                let context = String(committedJA.suffix(LiveSemanticEndpointer.asrContextCharacters))
+                let rawJA = (try? await asrFinal.transcribe(
+                    audio: windowAudio,
+                    context: context.isEmpty ? nil : context
+                )) ?? ""
+                if let jaText = LiveClauseSelection.select(
+                    qwenJapanese: rawJA.trimmingCharacters(in: .whitespacesAndNewlines),
+                    appleJapanese: nil
+                ) {
+                    var enText: String?
+                    if !configuration.sansTraduction {
+                        enText = try? await translator.translateLive(
+                            japanese: jaText,
+                            glossary: glossary,
+                            history: Array(history.suffix(LiveSemanticEndpointer.historyLimit)),
+                            isFragment: false,
+                            sourceStart: Double(lastCommit) / LiveEndpointing.sampleRate,
+                            sourceEnd: Double(remaining) / LiveEndpointing.sampleRate
+                        )
+                    }
+                    let finalEN = enText ?? (configuration.sansTraduction ? jaText : "")
+                    await output.commit(
+                        start: Double(lastCommit) / LiveEndpointing.sampleRate,
+                        end: Double(remaining) / LiveEndpointing.sampleRate,
+                        japanese: jaText,
+                        english: enText,
+                        show: configuration.show
+                    )
+                    if !finalEN.isEmpty { configuration.onLine?(finalEN, true) }
+                }
+            }
+        } else if let sidecar, remaining - lastCommit >= Int(0.5 * LiveEndpointing.sampleRate) {
             let utteranceAudio = capture.samples(from: lastCommit, upTo: remaining)
             let startSeconds = Double(lastCommit) / LiveEndpointing.sampleRate
             let endSeconds = Double(remaining) / LiveEndpointing.sampleRate
@@ -554,7 +803,9 @@ struct LiveEngine: Sendable {
         maxTask?.cancel()
         await previewTask?.finish()
         await capture.stop()
-        await sidecar.shutdown()
+        await sidecar?.shutdown()
+        await asrFinal?.unload()
+        await alignerRT?.unload()
         await output.flush()
         let count = await output.committedCount
         Pipeline.log("live terminé : \(count) énoncé(s) → \(configuration.outputURL.path)")

@@ -339,6 +339,98 @@ private func runLiveFinalTierChecks() {
     }
 }
 
+// MARK: - Endpointing sémantique (décisions, terminaison japonaise, stabilité, silence)
+
+private func runSemanticEndpointerChecks() {
+    // Décision : table (règles du plan validé).
+    checkEqual(
+        LiveSemanticEndpointer.evaluate(silenceSeconds: 0.5, isTerminal: true, isStable: true, windowSeconds: 5),
+        .commitFinal, "terminale + stable → commitFinal"
+    )
+    checkEqual(
+        LiveSemanticEndpointer.evaluate(silenceSeconds: 2.0, isTerminal: true, isStable: false, windowSeconds: 5),
+        .commitFinal, "terminale + silence 2 s (sans stabilité) → commitFinal"
+    )
+    checkEqual(
+        LiveSemanticEndpointer.evaluate(silenceSeconds: 0.5, isTerminal: true, isStable: false, windowSeconds: 5, appleFinalized: true),
+        .commitFinal, "terminale + finalisation Apple → commitFinal"
+    )
+    checkEqual(
+        LiveSemanticEndpointer.evaluate(silenceSeconds: 0.5, isTerminal: false, isStable: true, windowSeconds: 5),
+        .hold, "incomplète + stable + silence court → hold"
+    )
+    checkEqual(
+        LiveSemanticEndpointer.evaluate(silenceSeconds: 2.0, isTerminal: false, isStable: true, windowSeconds: 5),
+        .commitFragment, "incomplète + silence 2 s → commitFragment"
+    )
+    checkEqual(
+        LiveSemanticEndpointer.evaluate(silenceSeconds: 0.4, isTerminal: false, isStable: false, windowSeconds: 5),
+        .hold, "incomplète + silence < 2 s → hold"
+    )
+    checkEqual(
+        LiveSemanticEndpointer.evaluate(silenceSeconds: 1.5, isTerminal: true, isStable: true, windowSeconds: 13),
+        .forceCut, "fenêtre ≥ 12 s → forceCut (prioritaire)"
+    )
+    checkEqual(
+        LiveSemanticEndpointer.evaluate(silenceSeconds: 1.5, isTerminal: true, isStable: true, windowSeconds: 11.9),
+        .commitFinal, "fenêtre < 12 s + terminale + stable → commitFinal"
+    )
+    checkEqual(
+        LiveSemanticEndpointer.evaluate(silenceSeconds: 1.99, isTerminal: true, isStable: false, windowSeconds: 5),
+        .hold, "terminale + 1,99 s (< 2 s) + instable → hold"
+    )
+    checkEqual(
+        LiveSemanticEndpointer.evaluate(silenceSeconds: 2.5, isTerminal: false, isStable: false, windowSeconds: 13),
+        .forceCut, "fenêtre ≥ 12 s → forceCut même sur clause incomplète"
+    )
+
+    // Terminaison japonaise : ponctuation + fins conservatrices (liste WhisperASR).
+    check(LiveSemanticEndpointer.isTerminalJapanese("これは何でした"), "terminale : fin « でした »")
+    check(LiveSemanticEndpointer.isTerminalJapanese("わかりませんでした"), "terminale : fin « ません »")
+    check(LiveSemanticEndpointer.isTerminalJapanese("そうですか。"), "terminale : point terminal « 。 »")
+    check(LiveSemanticEndpointer.isTerminalJapanese("本当？"), "terminale : point d'interrogation « ？」")
+    check(LiveSemanticEndpointer.isTerminalJapanese("  本当です  "), "terminale : « です » (marge ignorée)")
+    check(!LiveSemanticEndpointer.isTerminalJapanese("はい"), "non terminale : « はい »")
+    check(!LiveSemanticEndpointer.isTerminalJapanese("本当"), "non terminale : mot nu")
+    check(!LiveSemanticEndpointer.isTerminalJapanese("ちょっと待って"), "non terminale : « 待って » (non dans la liste)")
+    check(!LiveSemanticEndpointer.isTerminalJapanese(""), "non terminale : chaîne vide")
+    check(!LiveSemanticEndpointer.isTerminalJapanese("   "), "non terminale : espaces")
+
+    // Silence de fin (fonction pure : frames 100 ms, seuil 0,001).
+    func makeAudio(speechSeconds: Double, silenceSeconds: Double) -> [Float] {
+        var out: [Float] = []
+        out.reserveCapacity(Int((speechSeconds + silenceSeconds) * 16_000))
+        for _ in 0..<Int(speechSeconds * 16_000) { out.append(0.5) }
+        for _ in 0..<Int(silenceSeconds * 16_000) { out.append(0) }
+        return out
+    }
+    checkClose(LiveSemanticEndpointer.trailingSilenceSeconds(makeAudio(speechSeconds: 4, silenceSeconds: 2.5)),
+               2.5, accuracy: 0.001, "silence de fin : 2,5 s après parole")
+    checkClose(LiveSemanticEndpointer.trailingSilenceSeconds(makeAudio(speechSeconds: 0, silenceSeconds: 3)),
+               3.0, accuracy: 0.001, "silence de fin : tampon entièrement silencieux")
+    checkClose(LiveSemanticEndpointer.trailingSilenceSeconds(makeAudio(speechSeconds: 3, silenceSeconds: 0)),
+               0, accuracy: 0.001, "silence de fin : toute parole → 0")
+    checkClose(LiveSemanticEndpointer.trailingSilenceSeconds([0.5, 0.5, 0.5]),
+               0, accuracy: 0.001, "silence de fin : moins d'une frame → 0")
+    var middleSilence = makeAudio(speechSeconds: 2, silenceSeconds: 1)
+    middleSilence.append(contentsOf: makeAudio(speechSeconds: 1, silenceSeconds: 0))
+    checkClose(LiveSemanticEndpointer.trailingSilenceSeconds(middleSilence),
+               0, accuracy: 0.001, "silence de fin : silence médian (pas en fin) → 0")
+
+    // Suivi de stabilité : fenêtre 1,12 s, observations espacées de 0,4 s.
+    var tracker = SnapshotStabilityTracker()
+    let t0 = Date(timeIntervalSince1970: 1_000_000)
+    check(!tracker.observe("A", now: t0), "stabilité : première observation → false")
+    check(!tracker.observe("A", now: t0.addingTimeInterval(0.4)), "stabilité : 0,4 s → false")
+    check(!tracker.observe("A", now: t0.addingTimeInterval(0.8)), "stabilité : 0,8 s → false")
+    check(tracker.observe("A", now: t0.addingTimeInterval(1.2)), "stabilité : 1,2 s ≥ 1,12 s → true")
+    check(!tracker.observe("B", now: t0.addingTimeInterval(1.6)), "stabilité : changement de texte → false")
+    check(!tracker.observe("B", now: t0.addingTimeInterval(2.5)), "stabilité : B depuis 0,9 s → false")
+    check(tracker.observe("B", now: t0.addingTimeInterval(2.8)), "stabilité : B depuis 1,2 s → true")
+    tracker.reset()
+    check(!tracker.observe("C", now: t0.addingTimeInterval(3.0)), "stabilité : reset → repart de zéro")
+}
+
 // MARK: - Modèles live (gated : MLXTRANSLATE_RUN_LIVE_MODELS=1)
 //
 // Charge Qwen3-ASR 1,7B JA + Qwen3-ForcedAligner (cache locaux), transcrit un
@@ -411,6 +503,7 @@ runCleanLiveChecks()
 runDegradedChecks()
 runAudioSpoolChecks()
 runLiveFinalTierChecks()
+runSemanticEndpointerChecks()
 runGoldenCheck()
 await runLiveModelsCheck()
 
