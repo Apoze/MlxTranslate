@@ -520,6 +520,10 @@ struct LiveEngine: Sendable {
         // ASR roulant (JA récent).
         var snapshot = ""
         var lastSnapshotThrough = 0
+        // Dernière source JA traduite par la passe de preview EN (cadence OU
+        // snapshot forcé) — dédoublement : pas de passe MT répétée sur un
+        // texte inchangé (queue silencieuse → même sortie ASR).
+        var lastPreviewSource: String?
         var stabilityTracker = SnapshotStabilityTracker()
         var history: [HighQualityAcceptedTranslationPair] = []
         var committedJA = ""
@@ -533,13 +537,65 @@ struct LiveEngine: Sendable {
             previewsEnabled: useQwenFinal && configuration.pseudoLive
         )
 
+        /// Passe de preview EN progressive : traduction streaming du
+        /// snapshot cumulé JA (`isFragment: true`, historique roulant borné
+        /// K=4, même contrat que le chemin de commit). Affichage SEUL —
+        /// l'endpointing sémantique a déjà consommé le texte JA ; la passe
+        /// n'affecte pas l'endpointing. Utilisée par les previews de
+        /// cadence (coordinateur) ET par le snapshot forcé au déclenchement
+        /// — la ligne roulante EN se met à jour en continu, y compris au
+        /// milieu d'une clause longue (la ligne ne rétrécit jamais : garde
+        /// monotone dans LiveOverlayState / LiveOutput).
+        func runEnglishPreviewPass(source: String, range: Range<Int>) async {
+            let rollingTimecode = LiveFormat.timecode(
+                Double(range.lowerBound) / LiveEndpointing.sampleRate
+            )
+            let channel = configuration.onApplePreview ?? configuration.onLine
+            let sourceStart = Double(range.lowerBound) / LiveEndpointing.sampleRate
+            let sourceEnd = Double(range.upperBound) / LiveEndpointing.sampleRate
+            let previewHistory = Array(history.suffix(LiveSemanticEndpointer.historyLimit))
+            let glossaryTerms = glossary
+            do {
+                let passStarted = Date()
+                let finalChunk = try await translator.translateLive(
+                    japanese: source,
+                    glossary: glossaryTerms,
+                    history: previewHistory,
+                    isFragment: true,
+                    sourceStart: sourceStart,
+                    sourceEnd: sourceEnd,
+                    onChunk: { chunk in
+                        guard !chunk.isEmpty else { return }
+                        LiveDebug.log("PSEUDO-LIVE(MT) chunk = \"\(chunk)\"")
+                        channel?(chunk, false)
+                        let line = "\(rollingTimecode) ~ \(chunk)"
+                        Task { await output.showPreview(line) }
+                    }
+                )
+                LiveDebug.log(
+                    "PSEUDO-LIVE(MT) EN=\"\(finalChunk)\" "
+                    + "(\(String(format: "%.0f", Date().timeIntervalSince(passStarted) * 1000)) ms)"
+                )
+                if !finalChunk.isEmpty {
+                    channel?(finalChunk, false)
+                    let line = "\(rollingTimecode) ~ \(finalChunk)"
+                    Task { await output.showPreview(line) }
+                }
+            } catch {
+                // Échec de la passe : on garde la dernière preview affichée
+                // (le snapshot JA a déjà alimenté l'endpointing).
+                LiveDebug.log("PSEUDO-LIVE(MT) en échec : \(error.localizedDescription)")
+            }
+        }
+
         /// Transcription d'un snapshot pseudo-live (travail planifié par le
         /// coordinateur) + enchaînement du travail coalescé (latest-wins).
         /// Met à jour la sortie du modèle (`snapshot`) consommée par
         /// l'endpointing sémantique, puis alimente la ligne roulante :
         /// - `--sans-traduction` : texte JA du snapshot (statu quo) ;
-        /// - sinon : preview EN progressive — traduction streaming (MT,
-        ///   `isFragment: true`) du snapshot cumulé, historique roulant borné.
+        /// - sinon : passe de preview EN progressive (`runEnglishPreviewPass`),
+        ///   dédupliquée par source JA (pas de passe MT répétée sur un texte
+        ///   inchangé — queue silencieuse, même sortie ASR).
         func runPendingPreview(_ work: QwenPseudoLivePreviewWork) async {
             guard let asrFinal else { return }
             do {
@@ -569,48 +625,15 @@ struct LiveEngine: Sendable {
                         Task {
                             await output.showPreview("\(rollingTimecode) ~ \(accepted.source)")
                         }
-                    } else {
-                        // Preview EN progressive : traduction streaming du
-                        // snapshot cumulé (« fragment incomplet — ne pas
-                        // compléter ni deviner »), historique roulant borné
-                        // (K=4, même contrat que le chemin de commit). La
-                        // ligne ne rétrécit jamais entre les passes (garde
-                        // monotone dans LiveOverlayState / LiveOutput).
-                        let sourceStart = Double(work.range.lowerBound) / LiveEndpointing.sampleRate
-                        let sourceEnd = Double(work.range.upperBound) / LiveEndpointing.sampleRate
-                        let previewHistory = Array(history.suffix(LiveSemanticEndpointer.historyLimit))
-                        let glossaryTerms = glossary
-                        do {
-                            let passStarted = Date()
-                            let finalChunk = try await translator.translateLive(
-                                japanese: accepted.source,
-                                glossary: glossaryTerms,
-                                history: previewHistory,
-                                isFragment: true,
-                                sourceStart: sourceStart,
-                                sourceEnd: sourceEnd,
-                                onChunk: { chunk in
-                                    guard !chunk.isEmpty else { return }
-                                    LiveDebug.log("PSEUDO-LIVE(MT) chunk = \"\(chunk)\"")
-                                    channel?(chunk, false)
-                                    let line = "\(rollingTimecode) ~ \(chunk)"
-                                    Task { await output.showPreview(line) }
-                                }
-                            )
-                            LiveDebug.log(
-                                "PSEUDO-LIVE(MT) EN=\"\(finalChunk)\" "
-                                + "(\(String(format: "%.0f", Date().timeIntervalSince(passStarted) * 1000)) ms)"
-                            )
-                            if !finalChunk.isEmpty {
-                                channel?(finalChunk, false)
-                                let line = "\(rollingTimecode) ~ \(finalChunk)"
-                                Task { await output.showPreview(line) }
-                            }
-                        } catch {
-                            // Échec de la passe : on garde la dernière preview
-                            // affichée (le snapshot JA a déjà alimenté l'endpointing).
-                            LiveDebug.log("PSEUDO-LIVE(MT) en échec : \(error.localizedDescription)")
-                        }
+                    } else if accepted.source != lastPreviewSource {
+                        // Preview EN progressive du snapshot cumulé — dédupliquée
+                        // par source JA (le snapshot forcé peut avoir traduit ce
+                        // même texte juste avant).
+                        lastPreviewSource = accepted.source
+                        await runEnglishPreviewPass(
+                            source: accepted.source,
+                            range: work.range
+                        )
                     }
                 }
                 if let next = completion.next {
@@ -679,6 +702,21 @@ struct LiveEngine: Sendable {
                             + "(\(String(format: "%.0f", Date().timeIntervalSince(asrStarted) * 1000)) ms, "
                             + "\(String(format: "%.1f", Double(windowAudio.count) / 16000.0)) s d'audio)"
                         )
+                        // Le snapshot forcé alimente aussi la ligne roulante EN
+                        // (même passe que les previews de cadence, dédupliquée
+                        // par source JA) — sans cela, sur un clip riche en
+                        // silences (la voie forcée prend toujours la main), la
+                        // ligne roulante ne se mettrait à jour qu'aux commits.
+                        if configuration.pseudoLive,
+                           !configuration.sansTraduction,
+                           !snapshot.isEmpty,
+                           snapshot != lastPreviewSource {
+                            lastPreviewSource = snapshot
+                            await runEnglishPreviewPass(
+                                source: snapshot,
+                                range: lastCommit..<available
+                            )
+                        }
                     } catch {
                         Pipeline.log("snapshot Qwen3-ASR en échec : \(error.localizedDescription)")
                         LiveDebug.log("ASR(Qwen3) snapshot en échec : \(error.localizedDescription)")
@@ -821,6 +859,9 @@ struct LiveEngine: Sendable {
                 stabilityTracker.reset()
                 snapshot = ""
                 lastSnapshotThrough = 0
+                // Nouvelle clause : la première preview se traduit toujours
+                // (même texte que la clause précédente ? on retarde pas).
+                lastPreviewSource = nil
                 // Libère le slot final et relance l'éventuel preview coalescé
                 // (la clause suivante reprend la roulante immédiatement).
                 if let pending = pseudoLiveCoordinator.completeFinal(finalWork) {
