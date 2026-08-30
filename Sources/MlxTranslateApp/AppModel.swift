@@ -29,6 +29,11 @@ final class AppModel: ObservableObject {
     @Published var liveApp: String = ""
     @Published var liveApps: [CaptureApp] = []
     @Published var liveModel: LocalMLXTranslator.Candidate = .productDefault
+    /// Niveau final ASR (qwenja par défaut / voxtral legacy).
+    @Published var liveASR: LiveFinalASR = .productDefault
+    /// Pseudo-live Qwen (snapshots roulants 2 s de la clause en cours) —
+    /// actif uniquement en mode qwenja.
+    @Published var livePseudoLive = true
     @Published var liveDelay: VoxtralTranscriptionDelay = .milliseconds960
     @Published var liveRunning = false
     @Published var liveStatus = ""
@@ -48,9 +53,12 @@ final class AppModel: ObservableObject {
         if let app = env["MLXTRANSLATE_GUI_LIVE_APP"] {
             liveApp = app
         }
-        // Test visuel de la barre de superposition (sans lancer de live).
+        // Test visuel de la barre de superposition (sans lancer de live) :
+        // deux finaux — un court, un long (enveloppe + rétrécissement de
+        // police + hauteur dynamique) — pour vérifier la fenêtre de 2 lignes.
         if env["MLXTRANSLATE_GUI_TEST_OVERLAY"] != nil {
-            overlay.set(text: "Bonjour, ceci est la barre de sous-titres.", isFinal: true)
+            overlay.commitFinal("The team finished the last part of the quarterly report an hour ago, and the manager asked everyone to stay until the numbers have been double checked against the client spreadsheet before we can send the final version over tomorrow morning")
+            overlay.commitFinal("I promised to pick up the kids from soccer practice at five, then drive home before it starts to rain, so I will be late to dinner unless someone can cover the first part of the evening cleanup for me this week")
         }
         // Auto-démarrage du live (test / script) : après un court délai pour laisser
         // l'app se poser.
@@ -124,6 +132,8 @@ final class AppModel: ObservableObject {
         let app = liveApp
         let model = liveModel
         let delay = liveDelay
+        let asrMode = liveASR
+        let pseudoLive = livePseudoLive
         let outURL = Pipeline.homeURL
             .appendingPathComponent("live-\(Int(Date().timeIntervalSince1970)).srt")
         liveRunning = true
@@ -146,13 +156,19 @@ final class AppModel: ObservableObject {
                     delay: delay,
                     outputURL: outURL
                 )
-                // Fenêtre défilante : l'INSTANTANÉ (preview Apple, basse latence) reste en
-                // bas (atténué) ; les FINAUX MLX stables s'empilent en haut (blanc).
+                // Niveau final ASR + pseudo-live (snapshots roulants de la
+                // clause en cours, cadence 2 s — moteur qwenja uniquement).
+                config.liveASR = asrMode
+                config.pseudoLive = pseudoLive
+                // Lignes de la superposition (2 lignes, `LiveOverlayState`) :
+                // l'APERÇU roulant (Apple basse latence + snapshots Qwen)
+                // reste en bas (blanc) ; le FINAL EN stable s'engage et fait
+                // défiler la fenêtre (2 finaux max, le plus ancien s'estompe).
                 config.onApplePreview = { [weak weakModel = self] text, _ in
                     MlxTranslate.LiveDebug.log("onApplePreview text=\"\(text)\"")
                     DispatchQueue.main.async {
                         MainActor.assumeIsolated {
-                            weakModel?.overlay.showInstant(text: text)
+                            weakModel?.overlay.showPreview(text)
                         }
                     }
                 }
@@ -163,7 +179,7 @@ final class AppModel: ObservableObject {
                     guard isFinal else { return }
                     DispatchQueue.main.async {
                         MainActor.assumeIsolated {
-                            weakModel?.overlay.commitStable(text: text)
+                            weakModel?.overlay.commitFinal(text)
                         }
                     }
                 }
@@ -191,7 +207,7 @@ final class AppModel: ObservableObject {
         liveRunning = false
         liveStatus = "À l'arrêt"
         overlayVisible = false
-        overlay.set(text: "", isFinal: true)
+        overlay.reset()
     }
 
     private func setLiveStatus(_ s: String) {

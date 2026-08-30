@@ -36,6 +36,20 @@ struct LiveView: View {
                     .labelsHidden()
                     .frame(width: 220)
                 }
+                LabeledContent("ASR final") {
+                    Picker("", selection: $model.liveASR) {
+                        ForEach(Array(LiveFinalASR.allCases), id: \.self) { mode in
+                            Text(mode.displayLabel).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 220)
+                }
+                LabeledContent("Pseudo-live Qwen") {
+                    Toggle("Snapshots roulants (2 s)", isOn: $model.livePseudoLive)
+                        .disabled(model.liveASR != LiveFinalASR.qwenJA)
+                        .help("Snapshots cumulatifs de la clause en cours (cadence 2 s) — mode Qwen3-ASR uniquement")
+                }
                 LabeledContent("Latence ASR") {
                     Picker("", selection: $model.liveDelay) {
                         ForEach(Array(VoxtralTranscriptionDelay.allCases), id: \.self) { d in
@@ -44,6 +58,7 @@ struct LiveView: View {
                     }
                     .labelsHidden()
                     .frame(width: 120)
+                    .disabled(model.liveASR != LiveFinalASR.voxtralQ4)
                 }
             }
 
@@ -63,8 +78,9 @@ struct LiveView: View {
             }
 
             Text("Au démarrage, une barre de sous-titres transparente et déplaçable "
-                 + "apparaît sur l'écran (fenêtre séparée de celle-ci). Le SRT est écrit "
-                 + "dans ~/.mlxtranslate.")
+                 + "apparaît sur l'écran (fenêtre séparée de celle-ci) : 2 lignes — "
+                 + "l'aperçu roulant en bas, le final le plus récent en haut (atténué). "
+                 + "Le SRT est écrit dans ~/.mlxtranslate.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             Spacer()

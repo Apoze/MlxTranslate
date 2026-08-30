@@ -531,6 +531,92 @@ private func runPseudoLiveCoordinatorChecks() {
     checkEqual(Glossaire.contextualStrings(terms: []), [], "contextualStrings : vide")
 }
 
+// MARK: - Superposition live (machine d'état pure + résolveur de mise en page)
+
+private func runLiveOverlayStateChecks() {
+    // Contenu : fenêtre de 2 finaux + aperçu roulant.
+    var s = LiveOverlayState()
+    check(!s.hasContent, "overlay : vide au démarrage")
+    checkEqual(s.topText, "", "overlay : ligne haute vide")
+    checkEqual(s.bottomText, "", "overlay : ligne basse vide")
+
+    s.commitFinal("Un")
+    checkEqual(s.bottomText, "Un", "overlay : final en bas (blanc)")
+    checkEqual(s.topText, "", "overlay : pas encore de final précédent")
+
+    s.showPreview("Roulant…")
+    checkEqual(s.bottomText, "Roulant…", "overlay : l'aperçu prend la ligne basse")
+    checkEqual(s.topText, "Un", "overlay : le final précédent s'estompe en haut")
+
+    s.commitFinal("Deux")
+    checkEqual(s.bottomText, "Deux", "overlay : final 2 en bas")
+    checkEqual(s.topText, "Un", "overlay : final 1 défile en haut")
+
+    s.commitFinal("Trois")
+    checkEqual(s.topText, "Deux", "overlay : fenêtre de 2 — final 1 sort")
+    checkEqual(s.bottomText, "Trois", "overlay : final 3 en bas")
+
+    s.showPreview("")
+    checkEqual(s.bottomText, "Trois", "overlay : aperçu vide → retour au final")
+    checkEqual(s.topText, "Deux", "overlay : haut inchangé (final précédent)")
+
+    s.reset()
+    check(!s.hasContent, "overlay : reset vide la fenêtre")
+
+    // Résolveur : estimation des lignes + rétrécissement de police.
+    let probe = LiveOverlayState()
+    checkEqual(probe.estimatedLines("", font: 20), 1, "overlay : texte vide = 1 ligne de réserve")
+    checkEqual(probe.estimatedLines(String(repeating: "a", count: 79), font: 20), 1,
+               "overlay : 79 car. = 1 ligne à 20 pt")
+    checkEqual(probe.estimatedLines(String(repeating: "a", count: 80), font: 20), 2,
+               "overlay : 80 car. = 2 lignes à 20 pt")
+    checkEqual(probe.fittedFont(""), 20, "overlay : police max si vide")
+    checkEqual(probe.fittedFont(String(repeating: "a", count: 238)), 19,
+               "overlay : 238 car. → rétrécit à 19 pt")
+    checkEqual(probe.fittedFont(String(repeating: "a", count: 300)), 15,
+               "overlay : 300 car. → 15 pt (plancher 14 pt)")
+    checkEqual(probe.truncated(String(repeating: "a", count: 250)).count, 250,
+               "overlay : 250 car. non tronqués")
+    checkEqual(probe.truncated(String(repeating: "a", count: 251)).count, 251,
+               "overlay : 251 car. → troncature + « … »")
+
+    // Mise en page : hauteur + hystérésis.
+    var l = LiveOverlayState()
+    checkClose(l.layout.panelHeight, 64, accuracy: 0.01, "overlay : hauteur par défaut 64")
+    l.showPreview("Court")
+    checkEqual(l.layout.bottomFont, 20, "overlay : texte court reste à 20 pt")
+    checkEqual(l.layout.bottomLines, 1, "overlay : texte court sur 1 ligne")
+
+    let long = String(repeating: "mot ", count: 63)   // 252 car. → plafonné 250
+    l.showPreview(long)
+    checkEqual(l.layout.bottomText.count, 251, "overlay : plafonné à 250 + « … »")
+    check(l.layout.bottomFont < 20, "overlay : texte long rétrécit (< 20 pt)")
+    check(l.layout.bottomLines <= 3, "overlay : jamais plus de 3 lignes")
+    check(l.layout.panelHeight <= 192, "overlay : hauteur plafonnée à 192")
+
+    // Hystérésis : la hauteur ne fait que croître entre aperçus.
+    let tall = l.layout.panelHeight
+    l.showPreview("Hi")
+    checkClose(l.layout.panelHeight, tall, accuracy: 0.01,
+               "overlay : pas de rétrécissement pendant les aperçus (hystérésis)")
+
+    // Recomputation complète au commit : la hauteur peut rétrécir.
+    l.commitFinal("Fin")
+    checkClose(l.layout.panelHeight, 64, accuracy: 0.01,
+               "overlay : commit → recomputation (retour au minimum ici)")
+
+    // Bornes max : 3 lignes haut + 3 lignes bas = 192.
+    var m = LiveOverlayState()
+    let a = String(repeating: "premier terme ", count: 18)   // ~252 car. → 250
+    let b = String(repeating: "second terme ", count: 18)
+    m.commitFinal(a)
+    m.commitFinal(b)
+    checkEqual(Int(m.layout.panelHeight), 192, "overlay : 3+3 lignes = 192 px")
+    checkEqual(m.layout.topLines, 3, "overlay : ligne haute sur 3 lignes")
+    checkEqual(m.layout.bottomLines, 3, "overlay : ligne basse sur 3 lignes")
+}
+
+
 // MARK: - Modèles live (gated : MLXTRANSLATE_RUN_LIVE_MODELS=1)
 //
 // Charge Qwen3-ASR 1,7B JA + Qwen3-ForcedAligner (cache locaux), transcrit un
@@ -605,6 +691,7 @@ runAudioSpoolChecks()
 runLiveFinalTierChecks()
 runSemanticEndpointerChecks()
 runPseudoLiveCoordinatorChecks()
+runLiveOverlayStateChecks()
 runGoldenCheck()
 await runLiveModelsCheck()
 

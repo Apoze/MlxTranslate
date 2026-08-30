@@ -15,6 +15,14 @@ enum LiveFinalASR: String, CaseIterable, Codable, Sendable {
     static func cliValue(_ raw: String) -> Self? {
         Self(rawValue: raw.lowercased())
     }
+
+    /// Libellé lisible (GUI / aide CLI).
+    var displayLabel: String {
+        switch self {
+        case .qwenJA: "Qwen3-ASR 1,7B (JA)"
+        case .voxtralQ4: "Voxtral 4-bit (légacy)"
+        }
+    }
 }
 
 /// Garde des vides de la finale live : choisit le texte japonais à nourrir au
