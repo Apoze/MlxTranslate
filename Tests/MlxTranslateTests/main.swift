@@ -531,6 +531,23 @@ private func runPseudoLiveCoordinatorChecks() {
     checkEqual(Glossaire.contextualStrings(terms: []), [], "contextualStrings : vide")
 }
 
+// MARK: - Garde monotone de la preview (la ligne ne rétrécit jamais)
+
+private func runPreviewMonotoneChecks() {
+    var m = PreviewMonotone()
+    checkEqual(m.accept("Bonjour"), "Bonjour", "monotone : vide → texte")
+    checkEqual(m.accept(""), "Bonjour", "monotone : candidat vide garde l'existant")
+    checkEqual(m.accept("Bonjour, salut"), "Bonjour, salut", "monotone : extension (préfixe) acceptée")
+    checkEqual(m.accept("Bonjour"), "Bonjour, salut", "monotone : rétrécissement retenu")
+    checkEqual(m.accept("Salut, tout va"), "Salut, tout va", "monotone : correction même longueur acceptée")
+    checkEqual(m.accept("Salut!"), "Salut, tout va", "monotone : correction plus courte retenu")
+    checkEqual(m.accept("Salut! Tout va bien"), "Salut! Tout va bien", "monotone : rattrapage (plus long) accepté")
+    checkEqual(m.accept("Salut! Tout va bien"), "Salut! Tout va bien", "monotone : identique → no-op")
+    m.reset()
+    checkEqual(m.accept(""), "", "monotone : après reset, vide reste vide")
+    checkEqual(m.accept("A"), "A", "monotone : après reset, accepte un texte court")
+}
+
 // MARK: - Superposition live (machine d'état pure + résolveur de mise en page)
 
 private func runLiveOverlayStateChecks() {
@@ -614,6 +631,23 @@ private func runLiveOverlayStateChecks() {
     checkEqual(Int(m.layout.panelHeight), 192, "overlay : 3+3 lignes = 192 px")
     checkEqual(m.layout.topLines, 3, "overlay : ligne haute sur 3 lignes")
     checkEqual(m.layout.bottomLines, 3, "overlay : ligne basse sur 3 lignes")
+
+    // Garde monotone : la ligne de preview ne rétrécit jamais entre deux
+    // passes (le début d'une nouvelle passe de re-traduction ne remplace pas
+    // le texte complet précédent ; elle tient jusqu'au rattrapage ou au commit).
+    var m2 = LiveOverlayState()
+    m2.showPreview("Hello, I'm doing well")
+    checkEqual(m2.bottomText, "Hello, I'm doing well", "overlay : preview affichée")
+    m2.showPreview("Hello,")
+    checkEqual(m2.bottomText, "Hello, I'm doing well", "overlay : rétrécissement retenu (monotone)")
+    m2.showPreview("Hello, I'm doing well, thank you")
+    checkEqual(m2.bottomText, "Hello, I'm doing well, thank you", "overlay : extension affichée")
+    m2.showPreview("")
+    checkEqual(m2.bottomText, "Hello, I'm doing well, thank you", "overlay : aperçu vide n'efface pas la ligne")
+    m2.commitFinal("Fin")
+    checkEqual(m2.bottomText, "Fin", "overlay : commit efface la ligne de preview")
+    m2.showPreview("Hi")
+    checkEqual(m2.bottomText, "Hi", "overlay : post-commit, preview courte acceptée (garde remise à zéro)")
 }
 
 
@@ -691,6 +725,7 @@ runAudioSpoolChecks()
 runLiveFinalTierChecks()
 runSemanticEndpointerChecks()
 runPseudoLiveCoordinatorChecks()
+runPreviewMonotoneChecks()
 runLiveOverlayStateChecks()
 runGoldenCheck()
 await runLiveModelsCheck()

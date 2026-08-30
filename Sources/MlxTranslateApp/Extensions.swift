@@ -10,6 +10,8 @@ extension LocalMLXTranslator.Candidate {
         case .qwen3_14B: "qwen3-14b"
         case .translateGemma12B: "gemma-12b"
         case .translateGemma4B: "gemma-4b"
+        case .qwen3_1B7: "qwen3-1.7b"
+        case .qwen3_4B: "qwen3-4b"
         }
     }
 }

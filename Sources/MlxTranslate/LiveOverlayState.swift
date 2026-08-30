@@ -64,6 +64,9 @@ struct LiveOverlayState {
     private var preview = ""
     /// Vrai tant qu'un aperçu est affiché (ligne bas = aperçu).
     private var previewActive = false
+    /// Garde monotone : la ligne ne rétrécit jamais entre deux passes
+    /// (remise à zéro à chaque commit final).
+    private var previewMonotone = PreviewMonotone()
 
     /// Hauteur affichée courante (hystérésis : ne fait que croître entre
     /// aperçus ; recomputée à chaque commit final).
@@ -97,9 +100,15 @@ struct LiveOverlayState {
 
     /// Aperçu roulant (clause en cours). La hauteur ne fait que croître
     /// (hystérésis live — pas de ressaut pendant la parole).
+    /// Garde monotone : le texte affiché ne rétrécit jamais entre deux
+    /// passes — un candidat qui ne progresse pas est retenu (l'ancien texte
+    /// est gardé jusqu'à ce que la nouvelle passe rattrape sa longueur, ou
+    /// jusqu'au commit suivant qui remet la garde à zéro).
     mutating func showPreview(_ text: String) {
-        preview = text
-        previewActive = !text.isEmpty
+        let accepted = previewMonotone.accept(text)
+        guard accepted != preview else { return }
+        preview = accepted
+        previewActive = !preview.isEmpty
         var candidate = layoutFor(top: topText, bottom: bottomText)
         currentHeight = max(currentHeight, candidate.panelHeight)
         candidate.panelHeight = currentHeight
@@ -115,6 +124,7 @@ struct LiveOverlayState {
         if finals.count > 2 { finals.removeFirst() }
         preview = ""
         previewActive = false
+        previewMonotone.reset()
         layout = layoutFor(top: topText, bottom: bottomText)
         currentHeight = layout.panelHeight
     }
@@ -124,6 +134,7 @@ struct LiveOverlayState {
         finals.removeAll()
         preview = ""
         previewActive = false
+        previewMonotone.reset()
         currentHeight = minPanelHeight
         layout = .empty
     }
