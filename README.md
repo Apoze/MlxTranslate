@@ -27,7 +27,8 @@ mlxtranslate aligner <média>               # horodatage, écrit « (JA).srt »
 mlxtranslate parlants <média>              # diarisation, RTTM + compte de locuteurs
 mlxtranslate traduire <média>              # traduction, écrit « (EN).srt »
 mlxtranslate finale <média>                # chaîne complète
-mlxtranslate aider
+mlxtranslate nettoyer                       # vide runs/ + live-*.srt (garde modèles + glossaire)
+mlxtranslate aider                          # aide (aussi : --help)
 ```
 
 Options :
@@ -116,6 +117,24 @@ swift-huggingface 0.9.0, swift-transformers 1.3.3.
 
 Les SRT offline sont écrits **côte à côte de la vidéo** :
 `<nom> (JA).srt` et `<nom> (EN).srt`.
+
+## Codes de sortie (scripts)
+
+`0` succès · `2` média · `3` transcrire · `4` aligner · `5` parlants · `6` traduire · `7` TCC/capture (live).
+
+## Dépannage
+
+- **TCC (live)** — le mode live exige l'accord « Enregistrement de l'écran » sur
+  le **nœud** qui lance le CLI (Terminal / DSH). Si le chemin du binaire change,
+  réaccordez. Voir `docs/tcc.md`.
+- **Sidecar Voxtral (live)** — le sidecar Python se télécharge à premier run
+  dans `~/.mlxtranslate/sidecar`. Un échec de téléchargement laisse le mode live
+  en erreur ; relancez après connexion réseau.
+- **metallib manquant** — `aligner`/`traduire`/`finale` ont besoin de
+  `mlx.metallib` : lancez d'abord `transcrire` (le télécharge), ou `nettoyer`
+  puis re-téléchargez.
+- **Memory (live)** — le mode live est stable : pic de ~190 MB au chargement du
+  modèle, puis ~80-90 MB ; pas de fuite sur 10 min.
 
 ## Construction
 
