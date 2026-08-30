@@ -207,11 +207,44 @@ private func runGoldenCheck() {
     }
 }
 
+// MARK: - Cas dégradés offline (muet, longue vidéo, sans dialogue)
+
+private func runDegradedChecks() {
+    // --- Audio muet : la transcription produit des chunks vides, l'alignement
+    // jetterait PipelineError.emptyTranscription. On vérifie les briques pures
+    // qui font que les chunks vides ne produisent aucun tour alignable.
+    checkEqual(SRT.sentences("").count, 0, "audio muet : aucune phrase dans la chaîne vide")
+    checkEqual(SRT.sentences("   ").count, 0, "audio muet : aucune phrase dans des espaces")
+    check(!SRT.containsJapanese(""), "audio muet : pas de japonais dans la chaîne vide")
+
+    // --- Longue vidéo : le chunking Audio.windows découpe en fenêtres de N s.
+    // Une vidéo de 2 min à 16 kHz = 192000 échantillons ; fenêtre 20 s = 320000.
+    let sampleRate = Audio.sampleRate
+    let longSamples = Array(repeating: Float(0), count: 2 * 60 * sampleRate)  // 2 min
+    let windows = Audio.windows(longSamples, seconds: 20)
+    checkEqual(windows.count, 6, "longue vidéo : 2 min → 6 fenêtres de 20 s")
+    if windows.count == 6 {
+        checkClose(windows[0].start, 0.0, accuracy: 0.001, "fenêtre 0 démarre à 0")
+        checkClose(windows[5].end, 120.0, accuracy: 0.001, "fenêtre 5 finit à 120 s")
+        for w in windows { check(w.end - w.start <= 20.0 + 0.001, "fenêtre ≤ 20 s") }
+    }
+    // Une durée inférieure à la fenêtre → une seule fenêtre.
+    checkEqual(Audio.windows(Array(repeating: Float(0), count: 5 * sampleRate), seconds: 20).count,
+               1, "courte vidéo : une seule fenêtre")
+
+    // --- Pas de dialogue : les textes non-japonais (musique, bruit) ne sont
+    // pas alignables (containsJapanese = false), donc ignorés par l'alignement.
+    check(!SRT.containsJapanese("♪ ♫ ♪"), "sans dialogue : pas de japonais dans des notes de musique")
+    check(!SRT.containsJapanese("abc 123 ???"), "sans dialogue : pas de japonais dans du texte latin")
+    check(SRT.containsJapanese("はい"), "dialogue : détecte le japonais")
+}
+
 // MARK: - point d'entrée
 
 runSRTChecks()
 runEndpointingChecks()
 runCLIParserChecks()
+runDegradedChecks()
 runGoldenCheck()
 
 print("[tests] \(checks) assertions, \(failures) échec(s)")
