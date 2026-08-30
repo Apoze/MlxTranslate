@@ -27,6 +27,9 @@ actor LocalMLXTranslator {
         case qwen2_5_7B = "qwen2.5-7b-4bit"
         case qwen3_8B = "qwen3-8b-4bit"
         case qwen3_14B = "qwen3-14b-4bit"
+        // Candidats légers (bench « hybride ») : mêmes pins MLX, 4-bit.
+        case qwen3_1B7 = "qwen3-1.7b-4bit"
+        case qwen3_4B = "qwen3-4b-4bit"
 
         // Défaut : qwen3-8b-4bit — vainqueur mesuré du test A/B (0 résidu CJK,
         // traduction la plus rapide hors téléchargement, plus naturel que 7B/14B).
@@ -39,6 +42,8 @@ actor LocalMLXTranslator {
             case .qwen2_5_7B: "mlx-community/Qwen2.5-7B-4bit"
             case .qwen3_8B: "mlx-community/Qwen3-8B-4bit"
             case .qwen3_14B: "mlx-community/Qwen3-14B-4bit"
+            case .qwen3_1B7: "mlx-community/Qwen3-1.7B-4bit"
+            case .qwen3_4B: "mlx-community/Qwen3-4B-4bit"
             }
         }
 
@@ -48,6 +53,7 @@ actor LocalMLXTranslator {
             case .translateGemma4B: "5788ec08c047f3f2e17808101b8d9566ac930d58"
             case .qwen2_5_7B, .qwen3_8B: "main"
             case .qwen3_14B: "a4d9b2df59d2c150bef02fcbe0d91046b7ca33a4"
+            case .qwen3_1B7, .qwen3_4B: "main"
             }
         }
 
@@ -66,6 +72,7 @@ actor LocalMLXTranslator {
                     "5795efcfc7c96fd273e600562e8b111bfcc427415de9001d0a07e70cd99cff19",
                     "2814562d654fe2d541fd4682804a0ccaa400e79701872c8e9f5998cf9481fdf8",
                 ]
+            case .qwen3_1B7, .qwen3_4B: []
             }
         }
 
@@ -75,6 +82,8 @@ actor LocalMLXTranslator {
                 ["model.safetensors"]
             case .translateGemma12B, .qwen3_14B:
                 ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+            case .qwen3_1B7, .qwen3_4B:
+                ["model.safetensors"]
             }
         }
 
@@ -84,6 +93,8 @@ actor LocalMLXTranslator {
             case .translateGemma4B: 4 * 1_024 * 1_024 * 1_024
             case .qwen2_5_7B, .qwen3_8B: 8 * 1_024 * 1_024 * 1_024
             case .qwen3_14B: 10 * 1_024 * 1_024 * 1_024
+            case .qwen3_1B7: 2 * 1_024 * 1_024 * 1_024
+            case .qwen3_4B: 4 * 1_024 * 1_024 * 1_024
             }
         }
 
@@ -91,6 +102,7 @@ actor LocalMLXTranslator {
             switch self {
             case .translateGemma12B, .translateGemma4B: ["<end_of_turn>"]
             case .qwen2_5_7B, .qwen3_8B, .qwen3_14B: ["<|im_end|>"]
+            case .qwen3_1B7, .qwen3_4B: ["<|im_end|>"]
             }
         }
 
@@ -394,22 +406,7 @@ actor LocalMLXTranslator {
                 pairs.append((japaneseForm, term.english))
             }
         }
-        var messages: [PromptMessage] = [
-            ["role": "system", "content": Self.translationSystemMessage],
-        ]
-        messages.append(qwenUserMessage(Self.formatExampleUser))
-        messages.append(["role": "assistant", "content": Self.formatExampleAssistant])
-        messages += pairs.flatMap { source, target in
-            [qwenUserMessage(source), ["role": "assistant", "content": target]]
-        }
-        // Contexte roulant : les clauses commises précédentes (JA → EN, K=4
-        // max) préservent le registre, la terminologie et les propres noms
-        // d'une clause à l'autre (sans cela chaque clause est isolée et le
-        // registre saute).
         let recent = history.suffix(4)
-        messages += recent.flatMap { pair in
-            [qwenUserMessage(pair.japanese), ["role": "assistant", "content": pair.english]]
-        }
         var contextText = Self.contextText(for: turn)
         if isFragment {
             // Clause incomplète (silence forcé) : on traduit ce qui est là,
@@ -422,18 +419,73 @@ actor LocalMLXTranslator {
             in-progress form; do not complete or speculate.
             """
         }
-        messages.append(qwenUserMessage(contextText))
+        let messages: [PromptMessage]
+        if candidate.usesTranslateGemmaContract {
+            // Le template chat de Translategemma : PAS de message system,
+            // alternance stricte user/assistant, et le contenu user est un
+            // bloc structuré [{type, source_lang_code, target_lang_code,
+            // text}] (cf. chat_template.jinja du modèle). On réutilise le
+            // même format que le chemin batch (directUserMessage).
+            var gemma: [PromptMessage] = []
+            gemma += pairs.flatMap { source, target in
+                [Self.directUserMessage(source), ["role": "assistant", "content": target]]
+            }
+            gemma += recent.flatMap { pair in
+                [Self.directUserMessage(pair.japanese), ["role": "assistant", "content": pair.english]]
+            }
+            var targetText = turn.japanese
+            if isFragment {
+                targetText += """
+
+
+                NOTE: the source text is an incomplete fragment (the speaker has \
+                not finished this clause). Translate only what is present, in a \
+                natural in-progress form; do not complete or speculate.
+                """
+            }
+            gemma.append(Self.directUserMessage(targetText))
+            messages = gemma
+        } else {
+            var qwen: [PromptMessage] = [
+                ["role": "system", "content": Self.translationSystemMessage],
+            ]
+            qwen.append(qwenUserMessage(Self.formatExampleUser))
+            qwen.append(["role": "assistant", "content": Self.formatExampleAssistant])
+            qwen += pairs.flatMap { source, target in
+                [qwenUserMessage(source), ["role": "assistant", "content": target]]
+            }
+            qwen += recent.flatMap { pair in
+                [qwenUserMessage(pair.japanese), ["role": "assistant", "content": pair.english]]
+            }
+            qwen.append(qwenUserMessage(contextText))
+            messages = qwen
+        }
         let parameters = Self.generationParameters
+        // Instrumentation debug (MLXTRANSLATE_DEBUG=1) : sépare le coût
+        // « préparation du prompt » (template Jinja + tokenisation) du coût
+        // de génération — indispensable pour diagnostiquer les TTFC anormaux.
+        let prepStart = Date()
         let input = try await container.prepare(
             input: UserInput(prompt: .messages(messages), additionalContext: ["enable_thinking": false])
         )
+        LiveDebug.log(
+            "[mlx-\(candidate.rawValue)] prepare(input) : \(String(format: "%.3f", Date().timeIntervalSince(prepStart))) s (\(messages.count) messages, prompt natif \(Int(input.text.tokens.shape[0])) tokens)"
+        )
+        let genStart = Date()
+        var firstChunkAt: Double?
         let stream = try await container.generate(input: input, parameters: parameters)
         var output = ""
         for await generation in stream {
             try Task.checkCancellation()
             output += generation.chunk ?? ""
+            if firstChunkAt == nil {
+                firstChunkAt = Date().timeIntervalSince(genStart)
+            }
             onChunk(Self.cleanLive(output))
         }
+        LiveDebug.log(
+            "[mlx-\(candidate.rawValue)] génération : premier chunk \(String(format: "%.3f", firstChunkAt ?? 0)) s, total \(String(format: "%.3f", Date().timeIntervalSince(genStart))) s, sortie \(output.count) chars"
+        )
         let final = Self.translationText(output, for: turn, candidate: candidate)
             ?? output.trimmingCharacters(in: .whitespacesAndNewlines)
         return final.isEmpty ? output.trimmingCharacters(in: .whitespacesAndNewlines) : final

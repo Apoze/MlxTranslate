@@ -14,6 +14,7 @@ import os
 enum ApplePreviewError: LocalizedError {
     case unsupported(String)
     case assetsMissing
+    case prepareFailed(underlying: String)
     case formatUnavailable
     case emptyTranslation
     case timedOut
@@ -22,6 +23,7 @@ enum ApplePreviewError: LocalizedError {
         switch self {
         case .unsupported(let language): "Apple Speech ne supporte pas \(language)."
         case .assetsMissing: "Les ressources Speech/Translation ne sont pas installées."
+        case .prepareFailed(let detail): "La préparation de la session de traduction a échoué : \(detail)"
         case .formatUnavailable: "Le format audio Speech est introuvable."
         case .emptyTranslation: "Traduction Apple vide."
         case .timedOut: "La traduction Apple n'a pas terminé avant l'échéance."
@@ -241,7 +243,10 @@ actor AppleSpeechService {
         guard let locale = await SpeechTranscriber.supportedLocale(
             equivalentTo: Locale(identifier: localeIdentifier)
         ) else { return false }
-        let transcriber = SpeechTranscriber(locale: locale, preset: .timeIndexedProgressiveTranscription)
+        // Préchauffage : la création du transcriber charge les assets Speech
+        // (état système, persistant) ; l'objet lui-même est jeté, start()
+        // en crée un autre.
+        _ = SpeechTranscriber(locale: locale, preset: .timeIndexedProgressiveTranscription)
         return true
     }
 }
@@ -258,10 +263,86 @@ actor AppleTranslationService {
             target: Locale.Language(identifier: "en"),
             preferredStrategy: .lowLatency
         )
-        guard await candidate.isReady else {
-            throw ApplePreviewError.assetsMissing
+        // 26.4+ : prépare la session avant de vérifier isReady — la session
+        // fraîchement créée n'est pas « ready » tant que prepareTranslation()
+        // n'a pas chargé ses assets (et télécharge le paquet si
+        // canRequestDownloads est vrai).
+        // prepareTranslation() est la porte fiable (isReady est optimiste).
+        // Délai 30 s : instantané si les assets sont installés, temps de
+        // téléchargement court sinon.
+        //
+        // notInstalled est une course avec translationd : après un démarrage ou
+        // un re-sync d'assets du daemon, prepareTranslation() peut jeter
+        // .notInstalled pendant que la synchronisation est en cours → 3
+        // essais, 3 s d'attente entre eux.
+        var prepareError: Error?
+        for attempt in 1...3 {
+            do {
+                try await withAsyncDeadline(
+                    .seconds(30),
+                    operationName: "préparation Apple Translation"
+                ) {
+                    try await candidate.prepareTranslation()
+                }
+                prepareError = nil
+                break
+            } catch let e as TranslationError where TranslationError.notInstalled ~= e {
+                prepareError = e
+                if attempt < 3 {
+                    LiveDebug.log(
+                        "[APPLE-TRANSLATION] notInstalled (essai \(attempt)/3) — translationd en cours de synchronisation, nouvel essai dans 3 s"
+                    )
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                }
+            } catch {
+                prepareError = error
+                break
+            }
+        }
+        if let prepareError {
+            // On ne gomme pas l'erreur sous-jacente : elle dit si c'est les
+            // assets, le réseau, ou un état de framework inattendu.
+            let detail = "\(prepareError) — \(prepareError.localizedDescription)"
+            LiveDebug.log("[APPLE-TRANSLATION] prepareTranslation() échec : \(detail)")
+            throw ApplePreviewError.prepareFailed(underlying: detail)
+        }
+        // isReady peut HANGER (canal d'observation du framework bloqué) →
+        // délai 10 s. Si prepareTranslation() a réussi, on accepte la session.
+        do {
+            let ready = try await withAsyncDeadline(
+                .seconds(10),
+                operationName: "isReady Apple Translation"
+            ) {
+                await candidate.isReady
+            }
+            if !ready {
+                LiveDebug.log(
+                    "[APPLE-TRANSLATION] isReady=false après prepareTranslation() réussi — session acceptée"
+                )
+            }
+        } catch {
+            LiveDebug.log(
+                "[APPLE-TRANSLATION] isReady en échec/délai (10 s) — session acceptée (prepareTranslation() OK)"
+            )
         }
         session = candidate
+        // Préchauffage : le premier translate() froid dépasse la deadline de
+        // 2 s (démarrage du moteur dans translationd). Un petit appel ici
+        // rend les traductions chaudes ≈ 250 ms. Non bloquant : l'échec
+        // laisse la session utilisable, la première ligne sera juste lente.
+        do {
+            _ = try await withAsyncDeadline(
+                .seconds(15),
+                operationName: "préchauffage Apple Translation"
+            ) {
+                try await candidate.translate("a").targetText
+            }
+            LiveDebug.log("[APPLE-TRANSLATION] préchauffage OK — traductions chaudes ≈ 250 ms")
+        } catch {
+            LiveDebug.log(
+                "[APPLE-TRANSLATION] préchauffage : \(error.localizedDescription)"
+            )
+        }
     }
 
     func translate(_ text: String) async throws -> String {

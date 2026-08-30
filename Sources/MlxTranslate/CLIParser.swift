@@ -11,6 +11,7 @@ struct Command {
         case finale = "finale"
         case live = "live"
         case nettoyer = "nettoyer"
+        case bench = "bench"
     }
 
     var verb: Verb
@@ -31,6 +32,11 @@ struct Command {
     var liveOutput: URL?
     var maxSeconds: Double?
     var listApps: Bool = false
+    // Bench (inspection RAM / latence / qualité — pas le produit)
+    var benchSansApple: Bool = false
+    var benchSansASR: Bool = false
+    var benchSansMT: Bool = false
+    var benchMT: [String] = []
 }
 
 enum CLIParser {
@@ -50,6 +56,9 @@ enum CLIParser {
               live        sous-titres EN temps réel de l'audio d'une application (JA)
               nettoyer    nettoie les sessions ~/.mlxtranslate (runs, live-*.srt,
                           captures/), garde les modèles et le glossaire
+              bench       inspection hors produit : RAM + latence + qualité des
+                          outils Apple on-device et des modèles MLX candidats,
+                          sur un clip (logs complets, sorties /tmp/mlx_bench_*)
               aider       cette aide
 
             Options :
@@ -79,7 +88,16 @@ enum CLIParser {
                 --delay 960|1200|2400                  latence Voxtral (défaut : 960)
                 --sortie <fichier>                     SRT live (défaut : ~/.mlxtranslate/live-<date>.srt)
                 --max N                                arrêt automatique après N secondes
-              Env : MLXTRANSLATE_PSEUDO_LIVE=0 désactive la roulante Qwen
+              bench <clip.wav>                       inspection RAM/latence/qualité :
+                --sans-apple                         saute la partie Apple on-device
+                --sans-asr                           saute les ASR MLX (SenseVoiceSmall,
+                                                     Qwen3-ASR 1,7B)
+                --sans-mt                            saute la partie traduction MLX
+                --mt a,b,c                           sous-ensemble de modèles MT
+                                                     (translategemma-4b, qwen3-1.7b,
+                                                     qwen3-4b, qwen3-8b ; défaut : tous)
+              Env : MLXTRANSLATE_BENCH_LOG = fichier de log bench (défaut /tmp/mlx_bench.log)
+                    MLXTRANSLATE_PSEUDO_LIVE=0 désactive la roulante Qwen
                     pseudo-live (mode qwenja ; active par défaut).
             """
         }
@@ -103,6 +121,10 @@ enum CLIParser {
         var maxSeconds: Double?
         var liveASR = LiveFinalASR.productDefault
         var listApps = false
+        var benchSansApple = false
+        var benchSansASR = false
+        var benchSansMT = false
+        var benchMT: [String] = []
 
         var index = 1
         while index < arguments.count {
@@ -110,7 +132,7 @@ enum CLIParser {
             switch argument {
             case "aider", "-h", "--help":
                 throw Help()
-            case "transcrire", "aligner", "parlants", "traduire", "finale", "live", "nettoyer":
+            case "transcrire", "aligner", "parlants", "traduire", "finale", "live", "nettoyer", "bench":
                 guard verb == nil else { throw unknown("commande en double : \(argument)") }
                 verb = Command.Verb(rawValue: argument)
             case "--asr":
@@ -186,6 +208,22 @@ enum CLIParser {
                 }
                 maxSeconds = seconds
                 index += 1
+            case "--sans-apple":
+                benchSansApple = true
+            case "--sans-asr":
+                benchSansASR = true
+            case "--sans-mt":
+                benchSansMT = true
+            case "--mt":
+                guard index + 1 < arguments.count else { throw unknown("--mt sans valeur") }
+                for item in arguments[index + 1].split(separator: ",") {
+                    let raw = String(item).trimmingCharacters(in: .whitespaces)
+                    guard !raw.isEmpty else { continue }
+                    // Validation précoce : nom inconnu → erreur (et non échec tardif).
+                    _ = try LocalMLXTranslator.Candidate.cliValue(raw)
+                    benchMT.append(raw)
+                }
+                index += 1
             case _ where argument.hasPrefix("-"):
                 throw unknown("option inconnue : \(argument)")
             default:
@@ -222,6 +260,22 @@ enum CLIParser {
             let videoURL = video ?? URL(fileURLWithPath: "nettoyer")
             return Command(verb: .nettoyer, video: videoURL)
         }
+        if selectedVerb == .bench {
+            // `bench` exige un clip 16 kHz en argument positionnel.
+            guard let clip = video else {
+                throw unknown("bench : média manquant (ex. `mlxtranslate bench /tmp/test_ja.wav`)")
+            }
+            return Command(
+                verb: .bench,
+                video: clip,
+                model: model,
+                glossary: glossary,
+                benchSansApple: benchSansApple,
+                benchSansASR: benchSansASR,
+                benchSansMT: benchSansMT,
+                benchMT: benchMT
+            )
+        }
         guard let selectedVideo = video else {
             throw Help()
         }
@@ -256,6 +310,8 @@ extension LocalMLXTranslator.Candidate {
         case "qwen3-14b", "qwen3_14b": return .qwen3_14B
         case "gemma-12b", "gemma12b", "translategemma-12b": return .translateGemma12B
         case "gemma-4b", "gemma4b", "translategemma-4b": return .translateGemma4B
+        case "qwen3-1.7b", "qwen3_1.7b", "qwen3-1b7", "qwen3_1b7": return .qwen3_1B7
+        case "qwen3-4b", "qwen3_4b": return .qwen3_4B
         default:
             throw CLIParser.UnknownArgument(detail: "modèle inconnu : \(raw)")
         }

@@ -253,6 +253,9 @@ enum Pipeline {
         case .live:
             // Inatteignable (géré ci-dessus) ; exhaustivité du switch.
             break
+        case .bench:
+            // Inatteignable (géré par le CLI) ; exhaustivité du switch.
+            break
         case .nettoyer:
             // Inatteignable (géré ci-dessus) ; exhaustivité du switch.
             break

@@ -36,6 +36,11 @@ enum MlxTranslateMain {
                 }
                 return
             }
+            if command.verb == .bench {
+                // Inspection RAM / latence / qualité (hors produit).
+                try await Bench.run(command)
+                return
+            }
             if command.verb == .finale {
                 Pipeline.log("chaîne complète : ASR → alignement → parlants → traduction")
             }
