@@ -256,6 +256,11 @@ struct LiveEngineConfiguration: Sendable {
     // engagé) + un flag « estFinal ». Sert à alimenter une barre de sous-titres GUI
     // (l'outil CLI renvoie nil → pas de superposition).
     var onLine: (@Sendable (String, Bool) -> Void)?
+    // Callback de l'INSTANTANÉ (preview Apple basse latence, JA roulant → EN) — distinct
+    // du final MLX (onLine). Alimente la ligne « instantané » de la superposition, qui
+    // reste affichée en continu pendant la parole (le final s'empile au-dessus).
+    // nil pour l'outil CLI (pas de superposition).
+    var onApplePreview: (@Sendable (String, Bool) -> Void)?
     // Signal d'arrêt externe (GUI « Arrêter ») : la boucle s'arrête quand il renvoie true
     // (en plus de SIGINT / --max / échec du flux SCK).
     var stopRequested: @Sendable () -> Bool = { false }
@@ -388,7 +393,9 @@ struct LiveEngine: Sendable {
             }
             previewTask = LivePreviewTask(
                 capture: capture, speech: speech, translation: translation, output: output,
-                previewLine: configuration.onLine
+                // L'instantané (preview Apple) va sur son callback dédié (ligne « instantané »
+                // de la superposition) ; repli sur onLine si non fourni (GUI ancienne version).
+                previewLine: configuration.onApplePreview ?? configuration.onLine
             )
             if let task = previewTask {
                 do {

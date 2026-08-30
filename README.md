@@ -178,11 +178,13 @@ open build/MlxTranslate.app
   de la latence Voxtral ; **Démarrer/Arrêter** capture l'audio de l'application,
   alimente la superposition et écrit le SRT live dans `~/.mlxtranslate`.
 - **Superposition** : une barre de sous-titres **transparente, flottante et
-  déplaçable** (fenêtre séparée de l'app) affiche l'EN en cours, style «
-  sous-titres YouTube » : la **preview basse latence** (Apple, atténuée) s'affiche
-  pendant la parole, puis le **final MLX** (blanc, stable) la remplace à
-  l'engagement de l'énoncé. Sa position est mémorisée. Menu **Superposition**
-  (de l'app) pour l'afficher/masquer.
+  déplaçable** (fenêtre séparée de l'app, 960×96, 3 lignes), style « sous-titres
+  YouTube » **défilants** : les **finaux MLX stables** (blanc) s'empilent en haut
+  (2 max, la plus ancienne défile) ; l'**instantané Apple** (preview basse latence,
+  atténué) reste toujours en bas pendant la parole — le final « arrive » au-dessus
+  sans écraser l'instantané. Deux flux distincts alimentent la barre (preview Apple
+  → ligne bas, final MLX → lignes stables). Sa position est mémorisée. Menu
+  **Superposition** (de l'app) pour l'afficher/masquer.
 - **Barre des menus** : une icône (bulle de sous-titres) permet de démarrer/arrêter
   le live, afficher la superposition, ouvrir la fenêtre, sans ouvrir l'app.
 

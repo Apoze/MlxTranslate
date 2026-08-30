@@ -7,17 +7,36 @@ import MlxTranslate
 /// la fenêtre principale ; sa position est mémorisée (UserDefaults).
 final class OverlayController: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
-    private let label = NSTextField(labelWithString: "")
+    // Fenêtre défilante : les 2 derniers FINAUX (stables, blanc) en haut, l'INSTANTANÉ
+    // (preview basse latence, atténué) toujours en bas. Quand un final s'engage, il
+    // s'empile en haut et la plus ancienne ligne défile hors de la fenêtre.
+    private let stableTopLabel = NSTextField(labelWithString: "")   // final le plus ancien (atténué, « défile »)
+    private let stableMidLabel = NSTextField(labelWithString: "")   // final le plus récent (blanc plein)
+    private let previewLabel = NSTextField(labelWithString: "")     // instantané (atténué)
+    private var stableLines: [String] = []   // borné à 2, plus récent en dernier
+    private var previewText = ""
     private let positionKey = "mlxtranslate.overlay.position"
+    private static let stableMax = 2
 
     override init() {
         super.init()
         build()
     }
 
+    private func makeLabel() -> NSTextField {
+        let l = NSTextField(labelWithString: "")
+        l.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
+        l.textColor = .white
+        l.alignment = .center
+        l.maximumNumberOfLines = 1
+        l.lineBreakMode = .byTruncatingTail
+        l.translatesAutoresizingMaskIntoConstraints = false
+        return l
+    }
+
     private func build() {
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 56),
+            contentRect: NSRect(x: 0, y: 0, width: 960, height: 96),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false)
         panel.isFloatingPanel = true
@@ -32,18 +51,25 @@ final class OverlayController: NSObject, NSWindowDelegate {
 
         let content = RoundedBackgroundView()
         content.wantsLayer = true
-
-        label.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
-        label.textColor = .white
-        label.alignment = .center
-        label.maximumNumberOfLines = 2
-        label.lineBreakMode = .byWordWrapping
-        label.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(label)
+        // 3 lignes de 32 px (96 au total) : stables en haut, instantané en bas.
+        for l in [stableTopLabel, stableMidLabel, previewLabel] {
+            content.addSubview(l)
+        }
+        stableTopLabel.textColor = .white.withAlphaComponent(0.6)   // le plus ancien : s'estompe
+        previewLabel.textColor = .white.withAlphaComponent(0.65)    // instantané : atténué
         NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: content.centerYAnchor),
-            label.widthAnchor.constraint(lessThanOrEqualToConstant: 600),
+            stableTopLabel.topAnchor.constraint(equalTo: content.topAnchor),
+            stableTopLabel.heightAnchor.constraint(equalToConstant: 32),
+            stableMidLabel.topAnchor.constraint(equalTo: stableTopLabel.bottomAnchor),
+            stableMidLabel.heightAnchor.constraint(equalToConstant: 32),
+            previewLabel.topAnchor.constraint(equalTo: stableMidLabel.bottomAnchor),
+            previewLabel.heightAnchor.constraint(equalToConstant: 32),
+            stableTopLabel.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            stableMidLabel.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            previewLabel.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            stableTopLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 920),
+            stableMidLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 920),
+            previewLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 920),
         ])
 
         panel.contentView = content
@@ -63,22 +89,59 @@ final class OverlayController: NSObject, NSWindowDelegate {
         panel?.orderOut(nil)
     }
 
-    /// Met à jour la barre avec le texte EN courant. La preview (EN en cours de
-    /// traduction) s'affiche en atténué ; le final s'affiche en blanc plein.
+    /// Ligne INSTANTANÉ (bas, atténué) : la preview Apple basse latence, toujours
+    /// affichée pendant la parole. N'affecte pas les lignes stables.
+    func showInstant(text: String) {
+        LiveDebug.log("SUPERPOSITION instantané text=\"\(text)\"")
+        previewText = text
+        previewLabel.stringValue = text
+        if !text.isEmpty { show() }
+    }
+
+    /// Un FINAL stable (MLX) s'engage : il s'empile en haut (blanc), la plus ancienne
+    /// ligne défile hors de la fenêtre (2 stables max). L'instantané (bas) continue.
+    func commitStable(text: String) {
+        LiveDebug.log("SUPERPOSITION final engagé text=\"\(text)\"")
+        guard !text.isEmpty else { return }
+        stableLines.append(text)
+        if stableLines.count > Self.stableMax { stableLines.removeFirst() }
+        updateStableLabels()
+        show()
+    }
+
+    /// Alimente la fenêtre défilante (point d'entrée unifié, utilisé par le pré-remplissage
+    /// de test et l'effacement).
+    /// - `isFinal == false` : l'INSTANTANÉ (bas, atténué).
+    /// - `isFinal == true` : un FINAL stable s'engage (haut) ; `text` vide → réinitialise
+    ///   la fenêtre et masque la barre.
     func set(text: String, isFinal: Bool) {
-        LiveDebug.log("SUPERPOSITION set isFinal=\(isFinal) text=\"\(text)\"")
-        label.stringValue = text
-        label.textColor = isFinal ? .white : NSColor.white.withAlphaComponent(0.65)
-        if text.isEmpty {
-            hide()
+        if isFinal {
+            if text.isEmpty { reset() } else { commitStable(text: text) }
         } else {
-            show()
+            showInstant(text: text)
         }
     }
 
-    /// Convenience : affiche un final.
+    /// Convenience : engage un final.
     func update(_ text: String) {
-        set(text: text, isFinal: true)
+        commitStable(text: text)
+    }
+
+    /// Vide la fenêtre (stables + instantané) et masque la barre.
+    func reset() {
+        stableLines.removeAll()
+        previewText = ""
+        stableTopLabel.stringValue = ""
+        stableMidLabel.stringValue = ""
+        previewLabel.stringValue = ""
+        hide()
+    }
+
+    // Réaffiche les 2 lignes stables : top = le plus ancien (s'estompe),
+    // middle = le plus récent (blanc plein).
+    private func updateStableLabels() {
+        stableTopLabel.stringValue = stableLines.count >= 2 ? stableLines[0] : ""
+        stableMidLabel.stringValue = stableLines.last ?? ""
     }
 
     // Position mémorisée ; sinon bas-centre de l'écran principal.

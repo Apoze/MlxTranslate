@@ -146,12 +146,24 @@ final class AppModel: ObservableObject {
                     delay: delay,
                     outputURL: outURL
                 )
-                // Superposition : le texte EN courant (preview en streaming, final engagé).
-                config.onLine = { [weak weakModel = self] text, isFinal in
-                    MlxTranslate.LiveDebug.log("onLine isFinal=\(isFinal) text=\"\(text)\"")
+                // Fenêtre défilante : l'INSTANTANÉ (preview Apple, basse latence) reste en
+                // bas (atténué) ; les FINAUX MLX stables s'empilent en haut (blanc).
+                config.onApplePreview = { [weak weakModel = self] text, _ in
+                    MlxTranslate.LiveDebug.log("onApplePreview text=\"\(text)\"")
                     DispatchQueue.main.async {
                         MainActor.assumeIsolated {
-                            weakModel?.overlay.set(text: text, isFinal: isFinal)
+                            weakModel?.overlay.showInstant(text: text)
+                        }
+                    }
+                }
+                config.onLine = { [weak weakModel = self] text, isFinal in
+                    MlxTranslate.LiveDebug.log("onLine isFinal=\(isFinal) text=\"\(text)\"")
+                    // Les chunks MLX (isFinal=false) n'alimentent que stderr ; seul le
+                    // final engagé (isFinal=true) s'empile dans les lignes stables.
+                    guard isFinal else { return }
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated {
+                            weakModel?.overlay.commitStable(text: text)
                         }
                     }
                 }
