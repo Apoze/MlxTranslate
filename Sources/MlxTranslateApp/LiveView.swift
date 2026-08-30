@@ -46,9 +46,20 @@ struct LiveView: View {
                     .frame(width: 220)
                 }
                 LabeledContent("Pseudo-live Qwen") {
-                    Toggle("Snapshots roulants (2 s)", isOn: $model.livePseudoLive)
+                    Toggle("Snapshots roulants", isOn: $model.livePseudoLive)
                         .disabled(model.liveASR != LiveFinalASR.qwenJA)
-                        .help("Snapshots cumulatifs de la clause en cours (cadence 2 s) — mode Qwen3-ASR uniquement")
+                        .help("Snapshots cumulatifs de la clause en cours — mode Qwen3-ASR uniquement")
+                }
+                LabeledContent("Cadence snapshot") {
+                    Picker("", selection: $model.liveCadence) {
+                        ForEach(Array(QwenPseudoLiveCadence.allCases), id: \.self) { cadence in
+                            Text("\(cadence.rawValue) s").tag(cadence)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 120)
+                    .disabled(model.liveASR != LiveFinalASR.qwenJA || !model.livePseudoLive)
+                    .help("Cadence de re-transcription cumulative (1/2/3 s) — prise en compte au redémarrage du live")
                 }
                 LabeledContent("Latence ASR") {
                     Picker("", selection: $model.liveDelay) {

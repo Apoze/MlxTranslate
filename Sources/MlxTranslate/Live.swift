@@ -279,11 +279,14 @@ struct LiveEngineConfiguration: Sendable {
     /// Niveau final ASR : `qwenJA` (défaut produit, endpointing sémantique
     /// Qwen3-ASR + aligneur) ou `voxtralQ4` (legacy).
     var liveASR: LiveFinalASR = LiveFinalASR.productDefault
-    /// Pseudo-live Qwen : snapshots cumulatifs de la clause en cours (cadence
-    /// 2 s) pilotés par `QwenPseudoLiveCoordinator` — ligne roulante de la
-    /// sortie du modèle final + aliment de l'endpointing sémantique. ON par
-    /// défaut en mode qwenja ; `MLXTRANSLATE_PSEUDO_LIVE=0` le désactive.
+    /// Pseudo-live Qwen : snapshots cumulatifs de la clause en cours pilotés
+    /// par `QwenPseudoLiveCoordinator` — ligne roulante EN (preview MT
+    /// progressive) + aliment de l'endpointing sémantique. ON par défaut en
+    /// mode qwenja ; `MLXTRANSLATE_PSEUDO_LIVE=0` le désactive.
     var pseudoLive: Bool = true
+    /// Cadence des snapshots cumulatifs (1 / 2 / 3 s) — prise en compte au
+    /// démarrage du live (redémarrage requis pour changer la valeur).
+    var pseudoLiveCadence: QwenPseudoLiveCadence = .productDefault
     // Callback de superposition : le texte EN courant (preview en streaming, puis final
     // engagé) + un flag « estFinal ». Sert à alimenter une barre de sous-titres GUI
     // (l'outil CLI renvoie nil → pas de superposition).
@@ -342,14 +345,15 @@ enum Live {
         let config = LiveEngineConfiguration(
             app: app,
             preview: command.livePreview && !command.sansTraduction,
-            model: command.model,
+            model: command.liveModel,
             glossaryURL: command.glossary ?? Pipeline.defaultGlossaryURL,
             delay: command.liveDelay,
             sansTraduction: command.sansTraduction,
             outputURL: outputURL,
             maxSeconds: command.maxSeconds,
             liveASR: command.liveASR,
-            pseudoLive: ProcessInfo.processInfo.environment["MLXTRANSLATE_PSEUDO_LIVE"] != "0"
+            pseudoLive: ProcessInfo.processInfo.environment["MLXTRANSLATE_PSEUDO_LIVE"] != "0",
+            pseudoLiveCadence: command.liveCadence
         )
         try await LiveEngine(configuration: config).run()
     }
@@ -520,11 +524,12 @@ struct LiveEngine: Sendable {
         var history: [HighQualityAcceptedTranslationPair] = []
         var committedJA = ""
         // Pseudo-live : coordinateur des snapshots cumulatifs Qwen (cadence
-        // 2 s, coalescing, générations). `stageFinal` bloque les previews du
-        // range commité ; `previewsEnabled` = false quand MLXTRANSLATE_PSEUDO_LIVE=0
-        // (l'endpointing s'appuie alors sur le snapshot forcé au déclenchement).
+        // configurable 1/2/3 s, coalescing, générations). `stageFinal`
+        // bloque les previews du range commité ; `previewsEnabled` = false
+        // quand MLXTRANSLATE_PSEUDO_LIVE=0 (l'endpointing s'appuie alors sur
+        // le snapshot forcé au déclenchement).
         var pseudoLiveCoordinator = QwenPseudoLiveCoordinator(
-            cadence: .productDefault,
+            cadence: configuration.pseudoLiveCadence,
             previewsEnabled: useQwenFinal && configuration.pseudoLive
         )
 

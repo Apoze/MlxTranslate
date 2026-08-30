@@ -150,6 +150,25 @@ private func runCLIParserChecks() {
     checkEqual(parse(["live", "--app", "VLC", "--sans-traduction"]).sansTraduction, true, "flag --sans-traduction")
     checkEqual(parse(["traduire", "video.mp4", "--modele", "qwen3-8b"]).model, .qwen3_8B, "option --modele")
 
+    // --- Cadence Qwen (live) : parsing + défaut
+    checkEqual(parse(["live", "--app", "VLC", "--cadence", "1"]).liveCadence, .seconds1, "option --cadence 1")
+    checkEqual(parse(["live", "--app", "VLC", "--cadence", "3"]).liveCadence, .seconds3, "option --cadence 3")
+    checkEqual(parse(["live", "--app", "VLC"]).liveCadence, QwenPseudoLiveCadence.productDefault, "cadence défaut (2 s)")
+    checkThrows(CLIParser.UnknownArgument.self, "--cadence invalide → UnknownArgument") {
+        _ = try CLIParser.parse(["mlxtranslate", "live", "--cadence", "5"])
+    }
+    checkThrows(CLIParser.UnknownArgument.self, "--cadence sans valeur → UnknownArgument") {
+        _ = try CLIParser.parse(["mlxtranslate", "live", "--cadence"])
+    }
+
+    // --- Modèle EN du live : défaut 1,7B ; `--modele` explicite respecté ;
+    //     le défaut offline (8b) reste inchangé.
+    checkEqual(parse(["live", "--app", "VLC"]).liveModel, .qwen3_1B7, "défaut live : qwen3-1.7b")
+    checkEqual(parse(["live", "--app", "VLC", "--modele", "qwen3-8b"]).liveModel, .qwen3_8B, "live : --modele explicite")
+    checkEqual(parse(["live", "--app", "VLC", "--modele", "qwen3-4b"]).liveModel, .qwen3_4B, "live : --modele 4b")
+    checkEqual(parse(["traduire", "video.mp4"]).model, .qwen3_8B, "défaut offline inchangé (8b)")
+    checkEqual(parse(["live", "--app", "VLC"]).model, .qwen3_8B, "live sans --modele : `model` (champ offline) inchangé")
+
     // erreurs
     checkThrows(CLIParser.Help.self, "help → Help") { _ = try CLIParser.parse(["mlxtranslate", "--help"]) }
     checkThrows(CLIParser.Help.self, "sans verbe → Help") { _ = try CLIParser.parse(["mlxtranslate"]) }

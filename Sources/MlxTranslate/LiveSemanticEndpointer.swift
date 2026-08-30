@@ -38,7 +38,10 @@ enum LiveSemanticEndpointer {
     /// Contexte ASR roulant : nombre de caractères JA récents passés au
     /// transcribeur (continuité lexicale).
     static let asrContextCharacters = 200
-    /// Cadence de ré-transcription cumulative du snapshot (s).
+    /// Cadence de référence de ré-transcription cumulative (s) — défaut
+    /// produit. La cadence effective est `QwenPseudoLiveCadence` (configurable
+    /// 1/2/3 s, GUI + CLI `--cadence`), consommée par
+    /// `QwenPseudoLiveCoordinator`.
     static let snapshotCadenceSeconds = 2.0
 
     /// Décision pure (tests table-driven).

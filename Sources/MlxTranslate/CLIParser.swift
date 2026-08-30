@@ -32,6 +32,11 @@ struct Command {
     var liveOutput: URL?
     var maxSeconds: Double?
     var listApps: Bool = false
+    /// Cadence des snapshots roulants Qwen (live uniquement ; 1/2/3 s).
+    var liveCadence: QwenPseudoLiveCadence = .productDefault
+    /// Modèle EN du live : `--modele` explicite, sinon le défaut live
+    /// (qwen3-1.7b — distinct du défaut offline, `model`).
+    var liveModel: LocalMLXTranslator.Candidate = .productDefault
     // Bench (inspection RAM / latence / qualité — pas le produit)
     var benchSansApple: Bool = false
     var benchSansASR: Bool = false
@@ -82,7 +87,11 @@ enum CLIParser {
               live --app <bundleID|nom>                capture l'audio de l'application
                 --sans-preview                         pas de preview (traduction finale seule)
                 --sans-traduction                      JA seul (pas de traduction EN finale)
-                --modele <id>                          modèle EN final (défaut : qwen3-8b)
+                --modele <id>                          modèle EN (défaut live : qwen3-1.7b ;
+                                                       `--modele qwen3-8b` force le 8b, etc.)
+                --cadence 1|2|3                        cadence des snapshots roulants Qwen en
+                                                       secondes (défaut : 2 ; prise en compte
+                                                       au démarrage du live)
                 --glossaire <chemin>                   glossaire de la traduction EN
                 --live-asr qwenja|voxtral              ASR final (défaut : qwenja, Qwen3-ASR 1,7B JA)
                 --delay 960|1200|2400                  latence Voxtral (défaut : 960)
@@ -121,6 +130,10 @@ enum CLIParser {
         var maxSeconds: Double?
         var liveASR = LiveFinalASR.productDefault
         var listApps = false
+        var liveCadence = QwenPseudoLiveCadence.productDefault
+        // `--modele` explicit (live) : sinon le défaut live (qwen3-1.7b) s'applique
+        // indépendamment du défaut offline (qwen3-8b).
+        var modelExplicit = false
         var benchSansApple = false
         var benchSansASR = false
         var benchSansMT = false
@@ -158,6 +171,15 @@ enum CLIParser {
             case "--modele":
                 guard index + 1 < arguments.count else { throw unknown("--modele sans valeur") }
                 model = try LocalMLXTranslator.Candidate.cliValue(arguments[index + 1])
+                modelExplicit = true
+                index += 1
+            case "--cadence":
+                guard index + 1 < arguments.count else { throw unknown("--cadence sans valeur") }
+                guard let raw = Int(arguments[index + 1]),
+                      let parsed = QwenPseudoLiveCadence(rawValue: raw) else {
+                    throw unknown("--cadence doit être 1, 2 ou 3")
+                }
+                liveCadence = parsed
                 index += 1
             case "--noms":
                 guard index + 1 < arguments.count else { throw unknown("--noms sans valeur") }
@@ -240,6 +262,10 @@ enum CLIParser {
         if selectedVerb == .live {
             // `live` n'a pas de média positionnel : l'app vient de `--app`.
             let videoURL = video ?? URL(fileURLWithPath: app ?? "live")
+            // Modèle EN par défaut du live : qwen3-1.7b (mesuré : TTFC 0,44 s,
+            // +0,98 GB RAM — adapté aux previews rapides) ; `--modele` reste
+            // disponible pour forcer un autre candidat (qwen3-8b, qwen3-4b…).
+            let liveModel: LocalMLXTranslator.Candidate = modelExplicit ? model : .qwen3_1B7
             return Command(
                 verb: .live,
                 video: videoURL,
@@ -252,7 +278,9 @@ enum CLIParser {
                 livePreview: livePreview,
                 liveOutput: liveOutput,
                 maxSeconds: maxSeconds,
-                listApps: listApps
+                listApps: listApps,
+                liveCadence: liveCadence,
+                liveModel: liveModel
             )
         }
         if selectedVerb == .nettoyer {

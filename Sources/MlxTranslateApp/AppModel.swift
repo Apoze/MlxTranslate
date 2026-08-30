@@ -28,12 +28,24 @@ final class AppModel: ObservableObject {
     // MARK: Live
     @Published var liveApp: String = ""
     @Published var liveApps: [CaptureApp] = []
-    @Published var liveModel: LocalMLXTranslator.Candidate = .productDefault
+    /// Modèle EN du live : qwen3-1.7b par défaut (mesuré : TTFC 0,44 s,
+    /// +0,98 GB RAM — adapté aux previews rapides) ; 8b/4b/gemma restants
+    /// disponibles (le défaut offline reste qwen3-8b).
+    @Published var liveModel: LocalMLXTranslator.Candidate = .qwen3_1B7
     /// Niveau final ASR (qwenja par défaut / voxtral legacy).
     @Published var liveASR: LiveFinalASR = .productDefault
-    /// Pseudo-live Qwen (snapshots roulants 2 s de la clause en cours) —
+    /// Pseudo-live Qwen (snapshots roulants de la clause en cours) —
     /// actif uniquement en mode qwenja.
     @Published var livePseudoLive = true
+    /// Cadence des snapshots cumulatifs (1/2/3 s) — prise en compte au
+    /// démarrage du live (redémarrage requis pour changer la valeur).
+    /// Persistée (UserDefaults, comme la position de la superposition).
+    @Published var liveCadence: QwenPseudoLiveCadence = .productDefault {
+        didSet {
+            UserDefaults.standard.set(liveCadence.rawValue, forKey: Self.cadenceDefaultsKey)
+        }
+    }
+    private static let cadenceDefaultsKey = "mlxtranslate.live.cadence"
     @Published var liveDelay: VoxtralTranscriptionDelay = .milliseconds960
     @Published var liveRunning = false
     @Published var liveStatus = ""
@@ -48,6 +60,12 @@ final class AppModel: ObservableObject {
 
     init() {
         refreshApps()
+        // Cadence des snapshots (persistance GUI, comme la position de la
+        // superposition) — valeur par défaut : 2 s (productDefault).
+        if let raw = UserDefaults.standard.object(forKey: Self.cadenceDefaultsKey) as? Int,
+           let cadence = QwenPseudoLiveCadence(rawValue: raw) {
+            liveCadence = cadence
+        }
         let env = ProcessInfo.processInfo.environment
         // Pré-sélection de l'app live (test / script).
         if let app = env["MLXTRANSLATE_GUI_LIVE_APP"] {
@@ -134,6 +152,7 @@ final class AppModel: ObservableObject {
         let delay = liveDelay
         let asrMode = liveASR
         let pseudoLive = livePseudoLive
+        let cadence = liveCadence
         let outURL = Pipeline.homeURL
             .appendingPathComponent("live-\(Int(Date().timeIntervalSince1970)).srt")
         liveRunning = true
@@ -157,9 +176,11 @@ final class AppModel: ObservableObject {
                     outputURL: outURL
                 )
                 // Niveau final ASR + pseudo-live (snapshots roulants de la
-                // clause en cours, cadence 2 s — moteur qwenja uniquement).
+                // clause en cours, cadence configurable 1/2/3 s — moteur
+                // qwenja uniquement).
                 config.liveASR = asrMode
                 config.pseudoLive = pseudoLive
+                config.pseudoLiveCadence = cadence
                 // Lignes de la superposition (2 lignes, `LiveOverlayState`) :
                 // l'APERÇU roulant (Apple basse latence + snapshots Qwen)
                 // reste en bas (blanc) ; le FINAL EN stable s'engage et fait
