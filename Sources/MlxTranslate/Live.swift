@@ -20,6 +20,11 @@ actor LiveOutput {
     private var cues: [Cue] = []
     private var cueIndex = 0
     private var sessionStart = Date()
+    private var lastPreviewShow = Date.distantPast
+    private var latestPreview = ""
+    /// Délai minimal entre deux lignes preview (lissé anti-scintillement) :
+    /// un seul affichage par fenêtre, le texte le plus récent gagne.
+    private static let previewThrottle: TimeInterval = 0.2
 
     init(fileURL: URL) {
         self.fileURL = fileURL
@@ -29,14 +34,23 @@ actor LiveOutput {
         )
     }
 
-    // Ligne preview (provisoire) : surcouche la ligne de stderr.
+    // Ligne preview (provisoire) : surcouche la ligne de stderr. Throttlée
+    // (≤ 1 affichage / 200 ms, le texte le plus récent gagne) pour éviter le
+    // scintillement quand les chunks (streaming MLX, preview Apple) arrivent
+    // plus vite que 200 ms.
     func showPreview(_ text: String) {
         guard !text.isEmpty else { return }
-        FileHandle.standardError.write(Data(("\r\u{1B}[K" + text).utf8))
+        latestPreview = text
+        let now = Date()
+        guard now.timeIntervalSince(lastPreviewShow) >= Self.previewThrottle else { return }
+        lastPreviewShow = now
+        FileHandle.standardError.write(Data(("\r\u{1B}[K" + latestPreview).utf8))
     }
 
-    // Efface la ligne preview.
+    // Efface la ligne preview + réinitialise le throttle pour que le prochain
+    // énoncé s'affiche immédiatement (sans attendre la fenêtre de 200 ms).
     func clearPreview() {
+        lastPreviewShow = Date.distantPast
         FileHandle.standardError.write(Data("\r\u{1B}[K".utf8))
     }
 
