@@ -124,6 +124,11 @@ final class AppModel: ObservableObject {
     private let liveStop = StopFlag()
 
     init() {
+        // Log de debug du live TOUJOURS actif dans l'app (le CLI reste sur
+        // l'env variable MLXTRANSLATE_DEBUG) :
+        // `~/.mlxtranslate/live-debug.log` (append, horodaté) — diagnostic
+        // des sessions réelles.
+        LiveDebug.forceEnabled = true
         refreshApps()
         // Cadence des snapshots (persistance GUI, comme la position de la
         // superposition) — valeur par défaut : 2 s (productDefault).

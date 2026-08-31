@@ -51,9 +51,10 @@ struct LivePausePlanner: Sendable {
     ///     (0 = la parole est encore en cours).
     ///   - speechStart: début (échantillon absolu) de la PREMIÈRE parole dans
     ///     la fenêtre courante (nil = aucune parole dans la fenêtre).
-    ///   - latestText: texte roulant courant (segment Apple / snapshot Qwen) —
-    ///     une fin terminale (ponctuation) commite immédiatement, sans
-    ///     attendre le silence ni la durée minimale de lot.
+    ///   - latestText: texte roulant courant (segment Apple / snapshot Qwen)
+    ///     — une fin terminale (ponctuation) commite sans attendre le
+    ///     silence, sous réserve du lot minimal (phrase ≥ 1,5 s) et du
+    ///     filet dur (5 s).
     mutating func observe(
         windowStart: Int,
         available: Int,
@@ -75,9 +76,14 @@ struct LivePausePlanner: Sendable {
             return .forced
         }
         // Fin de phrase dans le texte roulant (ponctuation terminale ou fin
-        // japonaise conservatrice) → commit immédiat — l'accumulation s'arrête
-        // à la fin de la phrase, pas seulement au silence.
-        if let latestText, LiveSemanticEndpointer.isTerminalJapanese(latestText) {
+        // japonaise conservatrice) → commit — avec LOT MINIMAL : la phrase
+        // doit faire ≥ `minimumBatchSeconds`. Sans cette garde, la
+        // ponctuation terminale du contenu DÉJÀ committé (texte roulant
+        // borné au dernier commit) ré-ouvrait des micro-fenêtres de
+        // 0,5–0,9 s → bruit ASR / hallucinations sur audio court.
+        if let latestText,
+           Double(available - start) / LiveEndpointing.sampleRate >= Self.minimumBatchSeconds,
+           LiveSemanticEndpointer.isTerminalJapanese(latestText) {
             return .pause
         }
         // Silence de 0,5 s après une phrase ≥ 1,5 s → commit.

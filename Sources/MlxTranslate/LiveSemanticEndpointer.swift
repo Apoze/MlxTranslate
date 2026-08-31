@@ -38,6 +38,13 @@ enum LiveSemanticEndpointer {
     /// Contexte ASR roulant : nombre de caractères JA récents passés au
     /// transcribeur (continuité lexicale).
     static let asrContextCharacters = 200
+    /// Contexte ASR roulant ACTIVÉ : les derniers `asrContextCharacters` du
+    /// JA committé sont injectés au transcribeur (prompt système). Désactivé
+    /// par défaut en live : le modèle RÉ-ÉMET le prompt système dans sa
+    /// sortie (écho) → répétitions de lignes SRT + hallucinations sur les
+    /// fenêtres courtes. WhisperASR n'utilise pas ce contexte en live
+    /// (option offline / bench).
+    static var asrContextEnabled = false
     /// Cadence de référence de ré-transcription cumulative (s) — défaut
     /// produit. La cadence effective est `QwenPseudoLiveCadence` (configurable
     /// 1/2/3 s, GUI + CLI `--cadence`), consommée par

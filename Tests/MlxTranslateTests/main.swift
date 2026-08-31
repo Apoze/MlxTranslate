@@ -779,6 +779,16 @@ private func runPausePlannerChecks() {
     checkEqual(planner9.observe(windowStart: 0, available: at(4.0), trailingSilenceSeconds: 0.0, speechStart: 0, latestText: "ありがとうございます。"), .pause, "planner : fin de phrase (。) → .pause")
     var planner10 = LivePausePlanner()
     checkEqual(planner10.observe(windowStart: 0, available: at(4.0), trailingSilenceSeconds: 0.0, speechStart: 0, latestText: "こんにちは"), nil, "planner : texte non terminal, sans silence → nil")
+    // LOT MINIMAL sur le trigger ponctuation : la phrase doit faire
+    // ≥ minimumBatchSeconds (1,5 s) — sans cette garde, la ponctuation
+    // terminale du contenu déjà committé ré-ouvrait des micro-fenêtres
+    // de 0,5–0,9 s (bruit ASR / hallucinations).
+    var planner11 = LivePausePlanner()
+    checkEqual(planner11.observe(windowStart: 0, available: at(1.0), trailingSilenceSeconds: 0.0, speechStart: at(0.2), latestText: "はい。"), nil, "planner : ponctuation mais phrase de 0,8 s (< 1,5 s) → nil (lot minimal)")
+    var planner12 = LivePausePlanner()
+    checkEqual(planner12.observe(windowStart: 0, available: at(2.0), trailingSilenceSeconds: 0.0, speechStart: at(0.2), latestText: "はい。"), .pause, "planner : ponctuation, phrase de 1,8 s (≥ 1,5 s) → .pause")
+    var planner13 = LivePausePlanner()
+    checkEqual(planner13.observe(windowStart: 0, available: at(1.7), trailingSilenceSeconds: 0.0, speechStart: at(0.2), latestText: "はい。"), .pause, "planner : ponctuation, phrase de 1,5 s (borne incluse) → .pause")
 
     // firstSpeechSample (VAD de fenêtre, RMS) :
     let frame = LiveEndpointing.frameSamples
@@ -878,6 +888,60 @@ private func runLiveOutputDedupChecks() async {
     checkEqual(await out2.committedCount, 1, "SRT dedup JA : 1 cue")
 }
 
+// MARK: - Roulante bornée (suffixe depuis le dernier commit)
+
+@available(macOS 26.4, *)
+private func runPreviewSuffixChecks() {
+    // La roulante est BORNEE au dernier commit : la preview affiche que le
+    // contenu NOUVEAU (depuis le dernier commit), pas l'historique cumulé
+    // de la session (bug des « sous-titres qui reviennent »).
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("mlx-preview-suffix-\(UUID().uuidString)")
+    let output = LiveOutput(fileURL: dir.appendingPathComponent("suffix.srt"))
+    func makeTask() -> LivePreviewTask {
+        LivePreviewTask(
+            capture: AppCapture(),
+            speech: AppleSpeechService(),
+            translation: AppleTranslationService(),
+            output: output
+        )
+    }
+    func update(_ text: String, finalized: Int) -> LiveSourceUpdate {
+        LiveSourceUpdate(
+            segment: TranscriptionSegment(start: 0, end: nil, text: text),
+            isFinal: finalized > 0,
+            finalizedThroughSample: finalized
+        )
+    }
+
+    let task = makeTask()
+    task.handleUpdate(update("こんにちは。", finalized: 32_000))
+    task.handleUpdate(update("こんにちは。さようなら。", finalized: 48_000))
+    checkEqual(task.previewText, "こんにちは。さようなら。", "roulante : avant commit = texte complet")
+
+    // Commit à 40 000 (4,0 s) : la borne est la dernière paire finalisée
+    // inférieure ou égale (32 000) → suffixe après cette longueur.
+    task.markCommitted(throughSample: 40_000)
+    checkEqual(task.previewText, "さようなら。", "roulante : commit à 4,0 s → suffixe nouveau uniquement")
+    checkEqual(task.committedSampleOffset, 40_000, "markCommitted : committedSampleOffset mis à jour")
+
+    // Commit à 48 000 (tout finalisé) → roulante vide.
+    task.markCommitted(throughSample: 48_000)
+    checkEqual(task.previewText, "", "roulante : commit complet → vide (pas de « retour » des sous-titres)")
+
+    // Sans paire finalisée (début de session) : on borne sur le texte
+    // courant (la roulante repart vide immédiatement).
+    let task2 = makeTask()
+    task2.handleUpdate(update("おはよう", finalized: 0))
+    task2.markCommitted(throughSample: 16_000)
+    checkEqual(task2.previewText, "", "roulante : sans finalisation → texte courant borné (vide)")
+
+    // Nouveau contenu après commit : le suffixe pousse (la ligne reste
+    // continue dans la phrase).
+    task.handleUpdate(update("こんにちは。さようなら。おはようございます。", finalized: 64_000))
+    checkEqual(task.previewText, "おはようございます。", "roulante : contenu nouveau après commit → suffixe seulement")
+}
+
 // MARK: - point d'entrée
 
 runSRTChecks()
@@ -892,6 +956,9 @@ runPseudoLiveCoordinatorChecks()
 runPreviewMonotoneChecks()
 runLiveOverlayStateChecks()
 runPausePlannerChecks()
+if #available(macOS 26.4, *) {
+    runPreviewSuffixChecks()
+}
 runRepetitionChecks()
 await runLiveOutputDedupChecks()
 runGoldenCheck()

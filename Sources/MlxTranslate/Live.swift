@@ -8,6 +8,10 @@ import os
 // (preview/final, MLX) → superposition, avec les timings.
 public enum LiveDebug {
     public static let enabled = ProcessInfo.processInfo.environment["MLXTRANSLATE_DEBUG"] != nil
+    /// Activation forcée (app GUI) : le log s'écrit même sans l'env variable
+    /// `MLXTRANSLATE_DEBUG` (le CLI reste sur l'env) — diagnostic des
+    /// sessions réelles (`~/.mlxtranslate/live-debug.log`, append, horodaté).
+    public static var forceEnabled = false
     private static let start = Date()
     private static let lock = NSLock()
     private static let wallClock: DateFormatter = {
@@ -29,7 +33,7 @@ public enum LiveDebug {
     /// Horodatage (heure murale + t+ depuis le début du live) + message, sur stderr
     /// et en append dans le fichier de debug (si activé).
     public static func log(_ message: @autoclosure () -> String) {
-        guard enabled else { return }
+        guard enabled || forceEnabled else { return }
         let now = Date()
         let t = now.timeIntervalSince(start)
         let line = "[live-debug \(wallClock.string(from: now)) t+\(String(format: "%.2f", t)) s] \(message())\n"
@@ -198,6 +202,15 @@ final class LivePreviewTask: @unchecked Sendable {
     /// cette borne ne changera plus. Signal d'endpointing complémentaire
     /// (stabilité dure) — lu depuis le moteur via `finalizedThroughSample`.
     private var finalizedThroughSampleLocked = 0
+    /// Paires (échantillon finalisé 16 kHz, longueur du texte cumulé à ce
+    /// moment) — permettent de borner la roulante au dernier commit : le
+    /// suffixe affiché/traduit est le contenu NOUVEAU depuis le dernier
+    /// commit, pas l'historique cumulé de la session (d'où les « sous-titres
+    /// qui reviennent » et les traductions sur tout le contenu ancien).
+    private var finalizedTextLengths: [(sample: Int, length: Int)] = []
+    /// Longueur (caractères) du texte roulant consommée par le dernier
+    /// commit : `previewText` = suffixe après cette borne.
+    private var committedTextLength = 0
     /// Formes JA du glossaire, injectées comme « context strings » du
     /// transcribeur Apple (bias lexical des termes propres).
     private let contextualStrings: [String]
@@ -254,18 +267,23 @@ final class LivePreviewTask: @unchecked Sendable {
         } catch { /* best-effort */ }
     }
 
-    // Traduction throttlée (≥ 0,25 s et texte changé) du texte roulant → EN
-    // bas : cadence 250 ms (plan produit) — la ligne se met à jour à chaque
+    // Traduction throttlée (≥ 0,25 s et texte changé) du SUFFIXE de la
+    // roulante (contenu nouveau depuis le dernier commit) → EN bas :
+    // cadence 250 ms (plan produit) — la ligne se met à jour à chaque
     // rafraîchissement, s'améliore à chaque résultat progressif du
-    // transcribeur (cumulatif dans la phrase), et le final MLX (glossaire) la
-    // remplace au commit. L'horodatage affiché est le DÉBUT de l'énoncé en
-    // cours (aligné sur le final/SRT), pas la position courante : les
-    // previews et les cues SRT utilisent alors la même base temporelle.
+    // transcribeur (cumulatif dans la phrase), et le final MLX (glossaire)
+    // la remplace au commit. L'horodatage affiché est le DÉBUT de l'énoncé
+    // en cours (dernier commit), pas la position courante : les previews
+    // et les cues SRT utilisent alors la même base temporelle.
     private func renderPreview() async {
-        let ja = jaLock.withLock { rollingJA }
+        let ja = previewText
+        // Fragment trop court ET phrase non terminale → on attend (pas de
+        // traduction de 1–2 caractères) ; fin terminale → traduction
+        // immédiate (la phrase est complète).
         guard ja != lastTranslatedJA,
               Date().timeIntervalSince(lastTranslateTime) >= 0.25,
-              !ja.isEmpty else { return }
+              !ja.isEmpty,
+              (ja.count >= 4 || LiveSemanticEndpointer.isTerminalJapanese(ja)) else { return }
         do {
             let started = Date()
             let en = try await translation.translate(ja)
@@ -287,12 +305,20 @@ final class LivePreviewTask: @unchecked Sendable {
         } catch { /* best-effort */ }
     }
 
-    private func handleUpdate(_ update: LiveSourceUpdate) {
+    // Interne (pas private) : alimenté par le callback du transcribeur ;
+    // testable directement (suite de tests).
+    func handleUpdate(_ update: LiveSourceUpdate) {
         let text = update.segment.text
         jaLock.lock()
         if !text.isEmpty { rollingJA = text }
         if update.finalizedThroughSample > finalizedThroughSampleLocked {
             finalizedThroughSampleLocked = update.finalizedThroughSample
+            // Borne de finalisation → longueur du texte cumulé au même
+            // instant (le texte avant cet échantillon ne changera plus).
+            finalizedTextLengths.append((update.finalizedThroughSample, rollingJA.count))
+            if finalizedTextLengths.count > 512 {
+                finalizedTextLengths.removeFirst(finalizedTextLengths.count - 512)
+            }
         }
         jaLock.unlock()
     }
@@ -308,6 +334,38 @@ final class LivePreviewTask: @unchecked Sendable {
     /// texte avant cette borne est définitif (signal d'endpointing).
     var finalizedThroughSample: Int {
         jaLock.withLock { finalizedThroughSampleLocked }
+    }
+
+    /// Suffixe de la roulante DEPUIS LE DERNIER COMMIT (contenu nouveau
+    /// seulement, pas l'historique cumulé de la session) — alimente la
+    /// preview (traduction + affichage) et la détection de fin de phrase
+    /// (planner d'endpointing). Avant le premier commit : texte complet.
+    var previewText: String {
+        jaLock.withLock {
+            String(rollingJA.dropFirst(min(committedTextLength, rollingJA.count)))
+        }
+    }
+
+    /// Borner la roulante au dernier commit (échantillon absolu 16 kHz) :
+    /// l'affichage, la traduction et l'endpointing n'utilisent que le
+    /// contenu NOUVEAU depuis cette borne — après un commit, la ligne
+    /// repart vide jusqu'au nouveau contenu (pas de « retour » des
+    /// sous-titres déjà committés).
+    /// - Sans paire de finalisation avant la borne (début de session) :
+    ///   rebond sur le texte courant (la roulante repart vide de suite).
+    func markCommitted(throughSample: Int) {
+        committedSampleOffset = throughSample
+        jaLock.lock()
+        var length = 0
+        for pair in finalizedTextLengths.reversed() where pair.sample <= throughSample {
+            length = pair.length
+            break
+        }
+        if length == 0 {
+            length = rollingJA.count
+        }
+        committedTextLength = min(length, rollingJA.count)
+        jaLock.unlock()
     }
 
     func finish() async {
@@ -715,7 +773,9 @@ struct LiveEngine: Sendable {
                     from: work.range.lowerBound, upTo: work.range.upperBound
                 )
                 let asrContext = rolling.with {
-                    String($0.committedJA.suffix(LiveSemanticEndpointer.asrContextCharacters))
+                    LiveSemanticEndpointer.asrContextEnabled
+                        ? String($0.committedJA.suffix(LiveSemanticEndpointer.asrContextCharacters))
+                        : ""
                 }
                 let started = Date()
                 let raw = try await asrFinal.transcribe(
@@ -1027,7 +1087,7 @@ struct LiveEngine: Sendable {
                 // Apple en mode `.apple` — défaut — ou snapshot Qwen en
                 // `.mlx`) : le commit ne attend pas le silence, l'accumulation
                 // s'arrête à la fin de la phrase.
-                let latestText = previewTask?.rollingText ?? rolling.with { $0.snapshot }
+                let latestText = previewTask?.previewText ?? rolling.with { $0.snapshot }
                 let decision = pausePlanner.observe(
                     windowStart: lastCommit,
                     available: available,
@@ -1084,13 +1144,15 @@ struct LiveEngine: Sendable {
                     utteranceStart = nil
                     advanceRollingState(past: lastCommit..<available)
                     lastCommit = available
-                    previewTask?.committedSampleOffset = lastCommit
+                    previewTask?.markCommitted(throughSample: lastCommit)
                     await trimCapture(upTo: lastCommit, fifo: fifo)
                     continue
                 }
 
                 let asrContext = rolling.with {
-                    String($0.committedJA.suffix(LiveSemanticEndpointer.asrContextCharacters))
+                    LiveSemanticEndpointer.asrContextEnabled
+                        ? String($0.committedJA.suffix(LiveSemanticEndpointer.asrContextCharacters))
+                        : ""
                 }
                 let entry = LiveEndpointFIFO.Entry(
                     windowStart: lastCommit,
@@ -1114,7 +1176,7 @@ struct LiveEngine: Sendable {
                 utteranceStart = nil
                 advanceRollingState(past: lastCommit..<available)
                 lastCommit = available
-                previewTask?.committedSampleOffset = lastCommit
+                previewTask?.markCommitted(throughSample: lastCommit)
                 await trimCapture(upTo: lastCommit, fifo: fifo)
                 continue
             }
@@ -1197,7 +1259,7 @@ struct LiveEngine: Sendable {
             }
 
             lastCommit = cut
-            previewTask?.committedSampleOffset = lastCommit
+            previewTask?.markCommitted(throughSample: lastCommit)
             if lastCommit >= Int(120 * LiveEndpointing.sampleRate) {
                 capture.trim(upTo: lastCommit)
             }
@@ -1205,54 +1267,83 @@ struct LiveEngine: Sendable {
 
         // --- Drain de la FIFO (fenêtres stagées avant l'arrêt) ----------------
         // Le worker traite le reste dans l'ordre (rien n'est perdu), puis
-        // termine (`isDrained`). La finalisation de l'audio restant suit —
-        // pas de double traitement (le spool a avancé jusqu'à la dernière
-        // fenêtre stagée ; seules les nouvelles arrivées sont finalisées).
+        // termine (`isDrained`).
+        //
+        // Borne d'arrêt : le nombre de PCM à l'instant de l'arrêt. La
+        // capture continue de tamponner pendant le drain (2,5–3 s par
+        // fenêtre) — la finalisation ne couvre QUE l'audio jusqu'à cette
+        // borne : pas de cue de 46 s d'audio « post-arrêt », et le
+        // signalement « Terminé » est rapide.
+        let stopBoundary = capture.sampleCount()
         await fifo.finishProducing()
         await commitWorker.value
 
-        // --- Finalisation de l'audio restant --------------------------------
-        let remaining = capture.sampleCount()
+        // --- Finalisation de l'audio restant (bornée à l'arrêt) ---------------
+        let remaining = stopBoundary
         if useQwenFinal, let asrFinal {
             if remaining - lastCommit >= Int(0.5 * LiveEndpointing.sampleRate) {
-                let windowAudio = capture.samples(from: lastCommit, upTo: remaining)
-                let context = rolling.with {
-                    String($0.committedJA.suffix(LiveSemanticEndpointer.asrContextCharacters))
-                }
-                let rawJA = (try? await asrFinal.transcribe(
-                    audio: windowAudio,
-                    context: context.isEmpty ? nil : context
-                )) ?? ""
-                let collapsedJA = LiveRepetition.collapse(
-                    rawJA.trimmingCharacters(in: .whitespacesAndNewlines)
-                )
-                if let jaText = LiveClauseSelection.select(
-                    qwenJapanese: collapsedJA,
-                    appleJapanese: nil
-                ) {
-                    var enText: String?
-                    if !configuration.sansTraduction {
-                        let finalHistory = rolling.with {
-                            Array($0.history.suffix(LiveSemanticEndpointer.historyLimit))
-                        }
-                        enText = try? await translator.translateLive(
-                            japanese: jaText,
-                            glossary: glossary,
-                            history: finalHistory,
-                            isFragment: false,
-                            sourceStart: Double(lastCommit) / LiveEndpointing.sampleRate,
-                            sourceEnd: Double(remaining) / LiveEndpointing.sampleRate
-                        )
+                // Morçelage : chaque morceau (≤ 6 s) est une passe complète
+                // (ASR → traduction → commit) — un cue par morceau
+                // (affichage progressif de la fin), l'état roulant
+                // (historique LLM + contexte ASR) est mis à jour entre les
+                // morceaux.
+                let chunkSize = Int(6.0 * LiveEndpointing.sampleRate)
+                var cursor = lastCommit
+                while remaining - cursor >= Int(0.5 * LiveEndpointing.sampleRate) {
+                    let end = min(cursor + chunkSize, remaining)
+                    let windowAudio = capture.samples(from: cursor, upTo: end)
+                    let context = rolling.with {
+                        LiveSemanticEndpointer.asrContextEnabled
+                            ? String($0.committedJA.suffix(LiveSemanticEndpointer.asrContextCharacters))
+                            : ""
                     }
-                    let finalEN = enText ?? (configuration.sansTraduction ? jaText : "")
-                    await output.commit(
-                        start: Double(lastCommit) / LiveEndpointing.sampleRate,
-                        end: Double(remaining) / LiveEndpointing.sampleRate,
-                        japanese: jaText,
-                        english: enText,
-                        show: configuration.show
+                    let rawJA = (try? await asrFinal.transcribe(
+                        audio: windowAudio,
+                        context: context.isEmpty ? nil : context
+                    )) ?? ""
+                    let collapsedJA = LiveRepetition.collapse(
+                        rawJA.trimmingCharacters(in: .whitespacesAndNewlines)
                     )
-                    if !finalEN.isEmpty { configuration.onLine?(finalEN, true) }
+                    if let jaText = LiveClauseSelection.select(
+                        qwenJapanese: collapsedJA,
+                        appleJapanese: nil
+                    ) {
+                        var enText: String?
+                        if !configuration.sansTraduction {
+                            let finalHistory = rolling.with {
+                                Array($0.history.suffix(LiveSemanticEndpointer.historyLimit))
+                            }
+                            enText = try? await translator.translateLive(
+                                japanese: jaText,
+                                glossary: glossary,
+                                history: finalHistory,
+                                isFragment: false,
+                                sourceStart: Double(cursor) / LiveEndpointing.sampleRate,
+                                sourceEnd: Double(end) / LiveEndpointing.sampleRate
+                            )
+                        }
+                        let finalEN = enText ?? (configuration.sansTraduction ? jaText : "")
+                        await output.commit(
+                            start: Double(cursor) / LiveEndpointing.sampleRate,
+                            end: Double(end) / LiveEndpointing.sampleRate,
+                            japanese: jaText,
+                            english: enText,
+                            show: configuration.show
+                        )
+                        if !finalEN.isEmpty { configuration.onLine?(finalEN, true) }
+                        // État roulant entre morceaux (contexte du morceau
+                        // suivant + historique LLM).
+                        rolling.with {
+                            $0.history.append(HighQualityAcceptedTranslationPair(
+                                cueID: "live-\($0.history.count)",
+                                japanese: jaText,
+                                english: finalEN.isEmpty ? jaText : finalEN
+                            ))
+                            $0.history = Array($0.history.suffix(LiveSemanticEndpointer.historyLimit))
+                            $0.committedJA += " \(jaText)"
+                        }
+                    }
+                    cursor = end
                 }
             }
         } else if let sidecar, remaining - lastCommit >= Int(0.5 * LiveEndpointing.sampleRate) {
