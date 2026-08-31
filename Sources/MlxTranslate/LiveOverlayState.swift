@@ -72,6 +72,21 @@ struct LiveOverlayState {
     /// Vrai tant que les chunks d'une passe de final MLX arrivent.
     private var streaming = false
 
+    // MARK: - Séquences de phrase (gardes anti-retour)
+
+    /// Séquence du dernier final engagé (la barre n'affiche plus que des
+    /// contenus d'une phrase SUIVANTE — les previews/finaux en retard de
+    /// la phrase engagée sont jetés, le texte ne « revient » pas).
+    private var lastCommittedSeq = -1
+    /// Séquence du contenu actuellement sur la ligne live (une preview de
+    /// la même phrase peut la réécrire sur place — reformulation d'une
+    /// même clause — mais pas une preview d'une phrase antérieure).
+    private var liveSeq = -1
+    /// Séquence de la preview stagée (le commit ne la promeut que si elle
+    /// appartient à une phrase STRICTEMENT postérieure à la phrase
+    /// engagée).
+    private var stagedSeq = -1
+
     /// Dernière mise en page calculée (à appliquer par le rendu AppKit).
     private(set) var layout = LiveOverlayLayout.empty
 
@@ -95,56 +110,81 @@ struct LiveOverlayState {
     /// Aperçu roulant (Apple, ou snapshots Qwen hors stream de final) :
     /// prend la ligne live **sur place** (remplacement direct — les
     /// états d'une même clause peuvent se reformuler, pas de garde
-    /// monotone). Pendant le stream d'un final MLX, l'aperçu est
-    /// stagé : il prend la ligne live dès que le final s'engage.
-    mutating func showPreview(_ text: String) {
+    /// monotone sur le TEXTE). Pendant le stream d'un final MLX, l'aperçu
+    /// est stagé : il prend la ligne live dès que le final s'engage.
+    ///
+    /// Garde de SÉQUENCE : une preview de la phrase déjà ENGAGÉE (séquence
+    /// ≤ `lastCommittedSeq`) ne réécrirait pas la ligne — c'est le cas du
+    /// « texte d'avant qui revient et grossit » : la preview Apple roulante
+    /// porte la séquence de la phrase EN COURS, pas celle de la phrase
+    /// engagée (le moteur ré-aiguille la séquence à chaque commit).
+    mutating func showPreview(_ text: String, seq: Int) {
         if streaming {
             stagedPreview = text
-        } else {
+            stagedSeq = seq
+        } else if seq > lastCommittedSeq, seq >= liveSeq {
             live = text
+            liveSeq = seq
         }
         recompute()
     }
 
     /// Chunk du stream de final MLX (cumulatif) : prend la ligne live
     /// sur place — la ligne « en cours » s'améliore chunk par chunk,
-    /// sans saut de source.
-    mutating func streamingChunk(_ text: String) {
+    /// sans saut de source. Le seq de la phrase (celle du FINAL, portée
+    /// par les chunks) est mémorisé : la preview stagée ne sera promue
+    /// qu'avec une séquence strictement postérieure.
+    mutating func streamingChunk(_ text: String, seq: Int) {
         streaming = true
         live = text
+        liveSeq = seq
         recompute()
     }
 
     /// Final EN engagé : prend le slot du haut (le plus ancien défile
     /// hors de la barre), la ligne live est vidée — sauf si une
-    /// preview Apple a été stagée pendant le stream : elle prend la
-    /// ligne live (la phrase suivante est déjà en formation).
-    mutating func commitFinal(_ text: String) {
+    /// preview Apple a été stagée pendant le stream ET qu'elle appartient
+    /// à une phrase STRICTEMENT postérieure à la phrase engagée : elle
+    /// prend la ligne live (la phrase suivante est déjà en formation).
+    /// Sinon la ligne repart vide (pas de « retour » de l'ancienne
+    /// phrase).
+    mutating func commitFinal(_ text: String, seq: Int) {
+        lastCommittedSeq = max(lastCommittedSeq, seq)
         if !text.isEmpty {
             finals.append(text)
             if finals.count > finalizedCap { finals.removeFirst() }
-            if !stagedPreview.isEmpty {
+            if !stagedPreview.isEmpty, stagedSeq > lastCommittedSeq {
                 live = stagedPreview
+                liveSeq = stagedSeq
                 stagedPreview = ""
+                stagedSeq = -1
             } else {
                 live = ""
+                liveSeq = -1
+                stagedPreview = ""
+                stagedSeq = -1
             }
         } else {
             // Final vide (énoncé sans contenu) : la ligne live est
             // vidée, rien ne s'engage.
             live = ""
+            liveSeq = -1
             stagedPreview = ""
+            stagedSeq = -1
         }
         streaming = false
         recompute()
     }
 
     /// Vide la barre (finalisés + live + stagé) et remet le drapeau de
-    /// stream.
+    /// stream + les séquences.
     mutating func reset() {
         finals.removeAll()
         live = ""
+        liveSeq = -1
         stagedPreview = ""
+        stagedSeq = -1
+        lastCommittedSeq = -1
         streaming = false
         layout = .empty
     }

@@ -157,9 +157,9 @@ final class AppModel: ObservableObject {
         // ancien défile hors de la barre) — pour vérifier le défilement de
         // la barre 3 lignes (2 finalisés + 1 live).
         if env["MLXTRANSLATE_GUI_TEST_OVERLAY"] != nil {
-            overlay.commitFinal("The team finished the last part of the quarterly report an hour ago, and the manager asked everyone to stay until the numbers have been double checked against the client spreadsheet before we can send the final version over tomorrow morning")
-            overlay.commitFinal("I promised to pick up the kids from soccer practice at five, then drive home before it starts to rain, so I will be late to dinner unless someone can cover the first part of the evening cleanup for me this week")
-            overlay.commitFinal("The third report is ready, the figures have been double checked, and the final version goes out tomorrow morning")
+            overlay.commitFinal("The team finished the last part of the quarterly report an hour ago, and the manager asked everyone to stay until the numbers have been double checked against the client spreadsheet before we can send the final version over tomorrow morning", seq: 0)
+            overlay.commitFinal("I promised to pick up the kids from soccer practice at five, then drive home before it starts to rain, so I will be late to dinner unless someone can cover the first part of the evening cleanup for me this week", seq: 1)
+            overlay.commitFinal("The third report is ready, the figures have been double checked, and the final version goes out tomorrow morning", seq: 2)
         }
         // Auto-démarrage du live (test / script) : après un court délai pour laisser
         // l'app se poser.
@@ -284,27 +284,27 @@ final class AppModel: ObservableObject {
                 // saut de source) ; les FINAUX stables s'engagent en haut
                 // (2 lignes finalisées, le plus ancien défile hors de la
                 // barre).
-                config.onApplePreview = { [weak weakModel = self] text, _ in
-                    MlxTranslate.LiveDebug.log("onApplePreview text=\"\(text)\"")
+                config.onApplePreview = { [weak weakModel = self] text, _, seq in
+                    MlxTranslate.LiveDebug.log("onApplePreview seq=\(seq) text=\"\(text)\"")
                     DispatchQueue.main.async {
                         MainActor.assumeIsolated {
-                            weakModel?.overlay.showPreview(text)
+                            weakModel?.overlay.showPreview(text, seq: seq)
                         }
                     }
                 }
-                config.onLine = { [weak weakModel = self] text, isFinal in
-                    MlxTranslate.LiveDebug.log("onLine isFinal=\(isFinal) text=\"\(text)\"")
+                config.onLine = { [weak weakModel = self] text, isFinal, seq in
+                    MlxTranslate.LiveDebug.log("onLine isFinal=\(isFinal) seq=\(seq) text=\"\(text)\"")
                     DispatchQueue.main.async {
                         MainActor.assumeIsolated {
                             if isFinal {
-                                weakModel?.overlay.commitFinal(text)
+                                weakModel?.overlay.commitFinal(text, seq: seq)
                             } else {
                                 // Chunks du stream de final MLX (cumulatifs) :
                                 // ils remplacent la ligne live sur place —
                                 // pendant la passe de qualité, la ligne
                                 // progresse visiblement au lieu de geler puis
                                 // de sauter.
-                                weakModel?.overlay.streamingChunk(text)
+                                weakModel?.overlay.streamingChunk(text, seq: seq)
                             }
                         }
                     }

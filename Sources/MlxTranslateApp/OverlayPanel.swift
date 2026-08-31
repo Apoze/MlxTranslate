@@ -110,29 +110,33 @@ final class OverlayController: NSObject, NSWindowDelegate {
 
     /// Aperçu roulant (clause en cours) : ligne live (sur place) ; pendant
     /// le stream d'un final, l'aperçu est stagé (il prend la ligne live au
-    /// prochain engagement).
-    func showPreview(_ text: String) {
-        LiveDebug.log("SUPERPOSITION aperçu text=\"\(text)\"")
-        state.showPreview(text)
+    /// prochain engagement). `seq` = numéro de la phrase en cours (croissant)
+    /// — l'aperçu de la phrase déjà ENGAGÉE (séquence inférieure) est jeté,
+    /// le texte ne « revient » pas.
+    func showPreview(_ text: String, seq: Int = -1) {
+        LiveDebug.log("SUPERPOSITION aperçu seq=\(seq) text=\"\(text)\"")
+        state.showPreview(text, seq: seq)
         applyLayout()
         if state.hasContent { show() }
     }
 
     /// Chunk du stream de final MLX (cumulatif) : remplace la ligne live
-    /// sur place — la ligne « en cours » s'améliore chunk par chunk.
-    func streamingChunk(_ text: String) {
-        LiveDebug.log("SUPERPOSITION stream final text=\"\(text)\"")
-        state.streamingChunk(text)
+    /// sur place — la ligne « en cours » s'améliore chunk par chunk. `seq`
+    /// = numéro de la phrase du final (portée par les chunks).
+    func streamingChunk(_ text: String, seq: Int = -1) {
+        LiveDebug.log("SUPERPOSITION stream final seq=\(seq) text=\"\(text)\"")
+        state.streamingChunk(text, seq: seq)
         applyLayout()
         show()
     }
 
     /// Un final EN stable s'engage : prend le slot du haut, le plus ancien
     /// défile hors de la barre, la ligne live est vidée (ou reprise par la
-    /// preview stagée de la phrase suivante).
-    func commitFinal(_ text: String) {
-        LiveDebug.log("SUPERPOSITION final engagé text=\"\(text)\"")
-        state.commitFinal(text)
+    /// preview stagée de la phrase SUIVANTE — séquence strictement
+    /// postérieure). `seq` = numéro de la phrase engagée.
+    func commitFinal(_ text: String, seq: Int = -1) {
+        LiveDebug.log("SUPERPOSITION final engagé seq=\(seq) text=\"\(text)\"")
+        state.commitFinal(text, seq: seq)
         applyLayout()
         show()
     }
@@ -150,17 +154,17 @@ final class OverlayController: NSObject, NSWindowDelegate {
     /// - `isFinal == false` : l'aperçu roulant (ligne live) ;
     /// - `isFinal == true` : un final s'engage ; `text` vide → réinitialise
     ///   la barre et masque la superposition.
-    func set(text: String, isFinal: Bool) {
+    func set(text: String, isFinal: Bool, seq: Int = -1) {
         if isFinal {
-            if text.isEmpty { reset() } else { commitFinal(text) }
+            if text.isEmpty { reset() } else { commitFinal(text, seq: seq) }
         } else {
-            showPreview(text)
+            showPreview(text, seq: seq)
         }
     }
 
     /// Convenience : engage un final.
-    func update(_ text: String) {
-        commitFinal(text)
+    func update(_ text: String, seq: Int = -1) {
+        commitFinal(text, seq: seq)
     }
 
     // MARK: - Affichage

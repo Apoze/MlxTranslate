@@ -24,6 +24,13 @@ actor LiveEndpointFIFO {
         let asrContext: String
         /// Horodatage du staging (uptime) — file d'attente journalisable.
         let stagedUptimeNanoseconds: UInt64
+        /// Numéro de séquence de la phrase (croissant au fil du live) —
+        /// l'index de la clause EN COURS au moment du staging : permet à
+        /// la superposition de distinguer les previews/finaux de la phrase
+        /// ENGAGÉE (à jeter) de ceux de la phrase SUIVANTE (à afficher).
+        /// `var` (défaut 0) pour que l'initialiseur memberwise le porte ;
+        /// immuable après construction.
+        var seq: Int = 0
     }
 
     private var pending: [Entry] = []

@@ -576,16 +576,16 @@ private func runLiveOverlayStateChecks() {
     check(!s.hasContent, "overlay : vide au démarrage")
     checkEqual(s.lines, ["", "", ""], "overlay : 3 slots vides")
 
-    s.commitFinal("Un")
+    s.commitFinal("Un", seq: 0)
     checkEqual(s.lines, ["", "Un", ""], "overlay : finalisé en slot moyen (arrimage bas)")
 
-    s.showPreview("Roulant…")
+    s.showPreview("Roulant…", seq: 1)
     checkEqual(s.lines, ["", "Un", "Roulant…"], "overlay : l'aperçu prend la ligne live (bas)")
 
-    s.commitFinal("Deux")
+    s.commitFinal("Deux", seq: 1)
     checkEqual(s.lines, ["Un", "Deux", ""], "overlay : final s'engage et défile, live vidée")
 
-    s.commitFinal("Trois")
+    s.commitFinal("Trois", seq: 2)
     checkEqual(s.lines, ["Deux", "Trois", ""], "overlay : fenêtre de 2 finaux — le plus ancien sort")
 
     s.reset()
@@ -593,32 +593,64 @@ private func runLiveOverlayStateChecks() {
 
     // Streaming : les chunks MLX prennent la ligne live sur place ; les
     // previews Apple sont stagées pendant le stream et reprennent la ligne
-    // live à l'engagement du final.
+    // live à l'engagement du final (si leur séquence est strictement
+    // postérieure à la phrase engagée).
     var m = LiveOverlayState()
-    m.commitFinal("Base")
-    m.streamingChunk("The team")
+    m.commitFinal("Base", seq: 0)
+    m.streamingChunk("The team", seq: 1)
     checkEqual(m.lines, ["", "Base", "The team"], "overlay : chunk stream sur la ligne live")
-    m.showPreview("Aperçu Apple")
+    m.showPreview("Aperçu Apple", seq: 2)
     checkEqual(m.lines, ["", "Base", "The team"], "overlay : aperçu stagé pendant le stream")
-    m.streamingChunk("The team worked hard")
+    m.streamingChunk("The team worked hard", seq: 1)
     checkEqual(m.lines, ["", "Base", "The team worked hard"], "overlay : le stream remplace sur place")
-    m.commitFinal("The team worked hard, together")
+    m.commitFinal("The team worked hard, together", seq: 1)
     checkEqual(m.lines, ["Base", "The team worked hard, together", "Aperçu Apple"],
-               "overlay : final s'engage ; l'aperçu stagé reprend la ligne live")
+               "overlay : final s'engage ; l'aperçu stagé (seq postérieure) reprend la ligne live")
 
     // Sans aperçu stagé : la ligne live est simplement vidée.
     var m2 = LiveOverlayState()
-    m2.commitFinal("Seul")
-    m2.streamingChunk("Chunk")
-    m2.commitFinal("Final streamé")
+    m2.commitFinal("Seul", seq: 0)
+    m2.streamingChunk("Chunk", seq: 1)
+    m2.commitFinal("Final streamé", seq: 1)
     checkEqual(m2.lines, ["Seul", "Final streamé", ""], "overlay : sans stagé → live vidée")
 
     // Final vide : vide le stream sans s'engager.
     var m3 = LiveOverlayState()
-    m3.commitFinal("A")
-    m3.streamingChunk("B")
-    m3.commitFinal("")
+    m3.commitFinal("A", seq: 0)
+    m3.streamingChunk("B", seq: 1)
+    m3.commitFinal("", seq: 1)
     checkEqual(m3.lines, ["", "A", ""], "overlay : final vide → live vidée (finalisé reste arrimé en bas)")
+
+    // Gardes de SÉQUENCE : pas de « retour » des previews d'une phrase déjà
+    // engagée (le texte d'avant ne « revient » ni ne grossit).
+    var g = LiveOverlayState()
+    g.showPreview("Phrase d'avant…", seq: 0)
+    checkEqual(g.lines, ["", "", "Phrase d'avant…"], "seq : preview de la phrase 0 sur la ligne live")
+    g.commitFinal("Final 0", seq: 0)
+    checkEqual(g.lines, ["", "Final 0", ""], "seq : final 0 engagé, live vidée")
+    g.showPreview("Phrase d'avant…", seq: 0)
+    checkEqual(g.lines, ["", "Final 0", ""], "seq : preview en retard (seq 0) rejetée après le commit")
+    g.showPreview("Début de la phrase 1", seq: 1)
+    checkEqual(g.lines, ["", "Final 0", "Début de la phrase 1"], "seq : preview de la phrase 1 acceptée")
+    g.showPreview("La phrase 1 grandit", seq: 1)
+    checkEqual(g.lines, ["", "Final 0", "La phrase 1 grandit"], "seq : preview de même seq grossit la ligne sur place")
+
+    // Preview stagée de la MÊME séquence que le final : non promue (c'est
+    // encore la phrase engagée, pas la suivante).
+    var g2 = LiveOverlayState()
+    g2.commitFinal("Base", seq: 0)
+    g2.streamingChunk("Stream", seq: 1)
+    g2.showPreview("Stagée obsolète", seq: 1)
+    g2.commitFinal("Final 1", seq: 1)
+    checkEqual(g2.lines, ["Base", "Final 1", ""], "seq : preview stagée de même seq non promue")
+
+    // Preview stagée d'une séquence postérieure (phrase suivante) : promue.
+    var g3 = LiveOverlayState()
+    g3.commitFinal("Base", seq: 0)
+    g3.streamingChunk("Stream", seq: 1)
+    g3.showPreview("Preview suivante", seq: 2)
+    g3.commitFinal("Final 1", seq: 1)
+    checkEqual(g3.lines, ["Base", "Final 1", "Preview suivante"], "seq : preview stagée de seq postérieure promue")
 
     // Résolveur : fitting des lignes + rétrécissement de police.
     let probe = LiveOverlayState()
@@ -641,10 +673,10 @@ private func runLiveOverlayStateChecks() {
     // Mise en page : hauteur constante, lignes tronquées.
     var l = LiveOverlayState()
     checkClose(Double(l.layout.panelHeight), 96, accuracy: 0.01, "overlay : hauteur constante 96 (3 lignes)")
-    l.commitFinal(String(repeating: "c", count: 200))
+    l.commitFinal(String(repeating: "c", count: 200), seq: 0)
     checkEqual(l.layout.lines[1].count, 114, "overlay : final long tronqué sur une ligne")
     checkClose(Double(l.layout.panelHeight), 96, accuracy: 0.01, "overlay : la hauteur reste constante")
-    l.showPreview("Hi")
+    l.showPreview("Hi", seq: 1)
     checkEqual(l.layout.lines[2], "Hi", "overlay : ligne live en slot bas")
     checkClose(Double(l.layout.panelHeight), 96, accuracy: 0.01, "overlay : plus aucun jump de hauteur")
 }
@@ -898,27 +930,49 @@ private func runPreviewSuffixChecks() {
     task.handleUpdate(update("こんにちは。さようなら。", finalized: 48_000))
     checkEqual(task.previewText, "こんにちは。さようなら。", "roulante : avant commit = texte complet")
 
-    // Commit à 40 000 (4,0 s) : la borne est la dernière paire finalisée
-    // inférieure ou égale (32 000) → suffixe après cette longueur.
-    task.markCommitted(throughSample: 40_000)
-    checkEqual(task.previewText, "さようなら。", "roulante : commit à 4,0 s → suffixe nouveau uniquement")
+    // Commit à 40 000 (4,0 s). Une finalisation a déjà FRANCHI la coupe
+    // (48 000 ≥ 40 000, Apple en avance) → saut immédiat à la longueur de
+    // CETTE finalisation : la queue de la phrase engagée (l'ancienne « ね。」)
+    // disparaît de la preview, pas juste le contenu finalisé avant la coupe.
+    task.markCommitted(throughSample: 40_000, seq: 1)
+    checkEqual(task.previewText, "", "roulante : finalisation déjà au-delà de la coupe → saut immédiat (pas de queue d'avant)")
     checkEqual(task.committedSampleOffset, 40_000, "markCommitted : committedSampleOffset mis à jour")
 
     // Commit à 48 000 (tout finalisé) → roulante vide.
-    task.markCommitted(throughSample: 48_000)
+    task.markCommitted(throughSample: 48_000, seq: 2)
     checkEqual(task.previewText, "", "roulante : commit complet → vide (pas de « retour » des sous-titres)")
 
     // Sans paire finalisée (début de session) : on borne sur le texte
     // courant (la roulante repart vide immédiatement).
     let task2 = makeTask()
     task2.handleUpdate(update("おはよう", finalized: 0))
-    task2.markCommitted(throughSample: 16_000)
+    task2.markCommitted(throughSample: 16_000, seq: 1)
     checkEqual(task2.previewText, "", "roulante : sans finalisation → texte courant borné (vide)")
 
     // Nouveau contenu après commit : le suffixe pousse (la ligne reste
     // continue dans la phrase).
     task.handleUpdate(update("こんにちは。さようなら。おはようございます。", finalized: 64_000))
     checkEqual(task.previewText, "おはようございます。", "roulante : contenu nouveau après commit → suffixe seulement")
+
+    // CAS (b) : à l'heure du commit, Apple est EN RETARD (aucune
+    // finalisation au-delà de la coupe) → le suffixe est encore contaminé
+    // par la queue de la phrase engagée ; quand la finalisation FRANCHIT la
+    // coupe, le trim saute (la queue ancienne disparaît — un seul saut).
+    let task3 = makeTask()
+    task3.handleUpdate(update("はじめに。", finalized: 32_000))
+    task3.handleUpdate(update("はじめに。さようなら。", finalized: 0))
+    task3.markCommitted(throughSample: 40_000, seq: 1)
+    // Seule paire finalisée : (32 000, 5) < 40 000 → borne à cette longueur,
+    // la queue (「さようなら。」) reste dans la preview (contaminée).
+    checkEqual(task3.previewText, "さようなら。", "suffixe : Apple en retard à la coupe → queue encore visible")
+    // La finalisation qui FRANCHIT la coupe arrive (48 000 ≥ 40 000) :
+    // le trim saute à la longueur courante (la queue d'avant disparaît).
+    task3.handleUpdate(update("はじめに。さようなら。ありがとう。", finalized: 48_000))
+    checkEqual(task3.previewText, "", "suffixe : finalisation qui franchit la coupe → saut (queue d'avant disparue)")
+    // Nouveau contenu après le franchissement : la preview pousse de nouveau
+    // (pas de re-trim — le saut est one-shot par commit).
+    task3.handleUpdate(update("はじめに。さようなら。ありがとう。またね。", finalized: 0))
+    checkEqual(task3.previewText, "またね。", "suffixe : nouveau contenu après le franchissement → la preview repousse (saut one-shot)")
 }
 
 // MARK: - point d'entrée

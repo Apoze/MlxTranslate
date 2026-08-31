@@ -217,9 +217,22 @@ final class LivePreviewTask: @unchecked Sendable {
     /// Début (échantillons 16 kHz) de l'énoncé en cours — mis à jour par le
     /// moteur live après chaque commit ; sert d'horodatage aux previews.
     var committedSampleOffset = 0
+    /// Séquence de la phrase EN COURS (compteur du moteur, croissant) —
+    /// portée par chaque preview : la superposition ignore les previews de
+    /// la phrase déjà engagée (texte en retard qui « revient »).
+    private let seqLock = OSAllocatedUnfairLock(initialState: 0)
+    /// Borne du dernier commit (échantillons 16 kHz) : le suffixe de la
+    /// preview doit SAUTER à la longueur de texte du premier résultat
+    /// FINALISÉ qui franchit cette borne — la queue de la phrase engagée
+    /// (déjà remplacée par son final MLX) ne pollue plus la preview de la
+    /// phrase suivante (l'ASR Apple finalise en retard sur la coupe).
+    private var pendingCutSample = 0
+    /// Le saut de suffixe du commit en attente a-t-il déjà eu lieu (borne
+    /// franchie par une finalisation) : un seul saut par commit.
+    private var cutTrimDone = false
     /// Callback de la preview basse latence (JA→EN roulant) : alimente la
     /// superposition GUI (l'outil CLI passe nil → pas de superposition).
-    var previewLine: (@Sendable (String, Bool) -> Void)?
+    var previewLine: (@Sendable (String, Bool, Int) -> Void)?
 
     init(
         capture: AppCapture,
@@ -227,7 +240,7 @@ final class LivePreviewTask: @unchecked Sendable {
         translation: AppleTranslationService,
         output: LiveOutput,
         contextualStrings: [String] = [],
-        previewLine: (@Sendable (String, Bool) -> Void)? = nil
+        previewLine: (@Sendable (String, Bool, Int) -> Void)? = nil
     ) {
         self.capture = capture
         self.speech = speech
@@ -300,7 +313,10 @@ final class LivePreviewTask: @unchecked Sendable {
             )
             // Superposition : preview basse latence (remplacée par le final MLX à la fin
             // de l'énoncé). L'outil CLI (pas de superposition) ne reçoit pas ce callback.
-            previewLine?(en, false)
+            // La séquence de phrase (croissante) permet à la barre d'ignorer cette
+            // preview si la phrase a déjà été engagée pendant son vol (texte en
+            // retard — plus de « retour » de l'ancienne ligne).
+            previewLine?(en, false, seqLock.withLock { $0 })
             await output.showPreview("\(timecode) ~ \(en)")
         } catch { /* best-effort */ }
     }
@@ -315,9 +331,21 @@ final class LivePreviewTask: @unchecked Sendable {
             finalizedThroughSampleLocked = update.finalizedThroughSample
             // Borne de finalisation → longueur du texte cumulé au même
             // instant (le texte avant cet échantillon ne changera plus).
-            finalizedTextLengths.append((update.finalizedThroughSample, rollingJA.count))
+            let length = rollingJA.count
+            finalizedTextLengths.append((update.finalizedThroughSample, length))
             if finalizedTextLengths.count > 512 {
                 finalizedTextLengths.removeFirst(finalizedTextLengths.count - 512)
+            }
+            // Saut du suffixe : la finalisation vient de FRANCHIR la borne du
+            // dernier commit → la preview saute à la longueur de texte de
+            // CETTE finalisation (la queue de la phrase engagée disparaît de
+            // la preview de la phrase suivante). Un seul saut par commit.
+            if !cutTrimDone,
+                pendingCutSample > 0,
+                update.finalizedThroughSample >= pendingCutSample,
+                length > committedTextLength {
+                committedTextLength = length
+                cutTrimDone = true
             }
         }
         jaLock.unlock()
@@ -353,18 +381,56 @@ final class LivePreviewTask: @unchecked Sendable {
     /// sous-titres déjà committés).
     /// - Sans paire de finalisation avant la borne (début de session) :
     ///   rebond sur le texte courant (la roulante repart vide de suite).
-    func markCommitted(throughSample: Int) {
+    /// - `seq` : numéro de la phrase EN COURS après le commit — porté par
+    ///   toutes les previews à venir (la superposition jette les previews
+    ///   de la phrase engagée, dont la séquence est inférieure).
+    /// - Suffixe contaminé : l'ASR Apple finalise EN RETARD sur la coupe —
+    ///   entre le commit et la finalisation qui franchit la borne, le
+    ///   suffixe contient la queue de la phrase engagée (texte « d'avant »
+    ///   qui grossissait sur la preview). Quand cette finalisation arrive,
+    ///   `handleUpdate` fait sauter le suffixe à sa longueur (plus de queue
+    ///   ancienne dans la preview de la phrase suivante).
+    func markCommitted(throughSample: Int, seq: Int) {
         committedSampleOffset = throughSample
+        seqLock.withLock { $0 = seq }
         jaLock.lock()
-        var length = 0
-        for pair in finalizedTextLengths.reversed() where pair.sample <= throughSample {
-            length = pair.length
+        // Suffixe contaminé : l'ASR Apple finalise EN RETARD sur la coupe
+        // (le filet 5 s coupe la phrase, mais la finalisation Apple de la
+        // queue reste en attente). Deux cas :
+        //
+        // (a) Une finalisation a déjà FRANCHI la coupe (Apple est en avance)
+        //     → sauter IMMÉDIATEMENT à la longueur de CETTE finalisation :
+        //     la queue de la phrase engagée disparaît de la preview, et le
+        //     saut n'aura pas lieu « plus tard » dans handleUpdate
+        //     (cutTrimDone posé).
+        // (b) Apple est en retard (aucune finalisation ≥ coupe) → borner à
+        //     la dernière finalisation AVANT la coupe ; le saut aura lieu
+        //     dans handleUpdate dès qu'une finalisation franchit la coupe
+        //     (un seul saut par commit, cutTrimDone).
+        var jumped = false
+        for pair in finalizedTextLengths where pair.sample >= throughSample {
+            committedTextLength = pair.length
+            jumped = true
             break
         }
-        if length == 0 {
-            length = rollingJA.count
+        if jumped {
+            cutTrimDone = true
+        } else {
+            var length = 0
+            for pair in finalizedTextLengths.reversed() where pair.sample <= throughSample {
+                length = pair.length
+                break
+            }
+            if length == 0 {
+                // Sans paire finalisée (début de session) : rebond sur le
+                // texte courant (la roulante repart vide de suite).
+                length = rollingJA.count
+            }
+            committedTextLength = min(length, rollingJA.count)
+            cutTrimDone = false
         }
-        committedTextLength = min(length, rollingJA.count)
+        committedTextLength = min(committedTextLength, rollingJA.count)
+        pendingCutSample = throughSample
         jaLock.unlock()
     }
 
@@ -413,14 +479,18 @@ struct LiveEngineConfiguration: Sendable {
     var preloadedAligner: Qwen3AlignerRuntime?
     var preloadedTranslator: LocalMLXTranslator?
     // Callback de superposition : le texte EN courant (preview en streaming, puis final
-    // engagé) + un flag « estFinal ». Sert à alimenter une barre de sous-titres GUI
-    // (l'outil CLI renvoie nil → pas de superposition).
-    var onLine: (@Sendable (String, Bool) -> Void)?
+    // engagé) + un flag « estFinal » + la SÉQUENCE de phrase (croissante, phrase en
+    // cours au moment de l'émission) — sert à alimenter une barre de sous-titres GUI
+    // (l'outil CLI renvoie nil → pas de superposition). La séquence permet à la barre
+    // d'ignorer les previews en retard de la phrase déjà ENGAGÉE (le texte ne
+    // « revient » pas).
+    var onLine: (@Sendable (String, Bool, Int) -> Void)?
     // Callback de l'INSTANTANÉ (preview Apple basse latence, JA roulant → EN) — distinct
     // du final MLX (onLine). Alimente la ligne « instantané » de la superposition, qui
     // reste affichée en continu pendant la parole (le final s'empile au-dessus).
+    // Mêmes arguments que `onLine` (texte, estFinal, séquence de phrase).
     // nil pour l'outil CLI (pas de superposition).
-    var onApplePreview: (@Sendable (String, Bool) -> Void)?
+    var onApplePreview: (@Sendable (String, Bool, Int) -> Void)?
     // Signal d'arrêt externe (GUI « Arrêter ») : la boucle s'arrête quand il renvoie true
     // (en plus de SIGINT / --max / échec du flux SCK).
     var stopRequested: @Sendable () -> Bool = { false }
@@ -663,6 +733,12 @@ struct LiveEngine: Sendable {
         // --- Boucle d'endpointing + finalisation ---------------------------
         let sr = LiveEndpointing.sampleRate
         var lastCommit = 0
+        // Séquence de phrase (croissante, par session live) : la clause EN
+        // COURS porte la séquence courante ; chaque coupe (staging FIFO ou
+        // avancement sans cue) incrémente — les previews/finaux de la phrase
+        // ENGAGÉE (séquence inférieure) sont jetés par la superposition,
+        // seuls ceux de la phrase SUIVANTE s'affichent.
+        var phraseSeq = 0
         var stopRequested = false
         // Endpointing « lâche » (règles WhisperASR) : commit au silence de
         // 0,5 s après une phrase ≥ 1,5 s, à la FIN DE PHRASE (silence OU
@@ -699,7 +775,7 @@ struct LiveEngine: Sendable {
         /// — la ligne roulante EN se met à jour en continu, y compris au
         /// milieu d'une clause longue (la ligne ne rétrécit jamais : garde
         /// monotone dans LiveOverlayState / LiveOutput).
-        func runEnglishPreviewPass(source: String, range: Range<Int>) async {
+        func runEnglishPreviewPass(source: String, range: Range<Int>, seq: Int) async {
             let rollingTimecode = LiveFormat.timecode(
                 Double(range.lowerBound) / LiveEndpointing.sampleRate
             )
@@ -722,7 +798,7 @@ struct LiveEngine: Sendable {
                     onChunk: { chunk in
                         guard !chunk.isEmpty else { return }
                         LiveDebug.log("PSEUDO-LIVE(MT) chunk = \"\(chunk)\"")
-                        channel?(chunk, false)
+                        channel?(chunk, false, seq)
                         let line = "\(rollingTimecode) ~ \(chunk)"
                         Task { await output.showPreview(line) }
                     }
@@ -732,7 +808,7 @@ struct LiveEngine: Sendable {
                     + "(\(String(format: "%.0f", Date().timeIntervalSince(passStarted) * 1000)) ms)"
                 )
                 if !finalChunk.isEmpty {
-                    channel?(finalChunk, false)
+                    channel?(finalChunk, false, seq)
                     let line = "\(rollingTimecode) ~ \(finalChunk)"
                     Task { await output.showPreview(line) }
                 }
@@ -808,7 +884,7 @@ struct LiveEngine: Sendable {
                     let channel = configuration.onApplePreview ?? configuration.onLine
                     if configuration.sansTraduction {
                         // Mode JA seul : la ligne roulante reste en JA (pas de MT).
-                        channel?(accepted.source, false)
+                        channel?(accepted.source, false, work.seq)
                         await output.showPreview("\(rollingTimecode) ~ \(accepted.source)")
                     } else if configuration.previewMode == .apple {
                         do {
@@ -818,7 +894,7 @@ struct LiveEngine: Sendable {
                                 "PREVIEW(Apple→EN) JA=\"\(accepted.source)\" → EN=\"\(en)\" "
                                 + "(\(String(format: "%.0f", Date().timeIntervalSince(enStarted) * 1000)) ms)"
                             )
-                            channel?(en, false)
+                            channel?(en, false, work.seq)
                             await output.showPreview("\(rollingTimecode) ~ \(en)")
                         } catch {
                             LiveDebug.log("PREVIEW(Apple→EN) échec : \(error.localizedDescription)")
@@ -835,7 +911,8 @@ struct LiveEngine: Sendable {
                         if isNew {
                             await runEnglishPreviewPass(
                                 source: accepted.source,
-                                range: work.range
+                                range: work.range,
+                                seq: work.seq
                             )
                         }
                     }
@@ -967,7 +1044,7 @@ struct LiveEngine: Sendable {
                             if !chunk.isEmpty {
                                 let n = chunkCounter.withLock { $0 += 1; return $0 }
                                 LiveDebug.log("MLX chunk #\(n) (preview cumulée) = \"\(chunk)\"")
-                                configuration.onLine?(chunk, false)
+                                configuration.onLine?(chunk, false, entry.seq)
                                 Task {
                                     await output.showPreview(
                                         "\(LiveFormat.timecode(windowStartSeconds)) ~ \(chunk)"
@@ -1001,8 +1078,8 @@ struct LiveEngine: Sendable {
                 show: configuration.show
             )
             if !finalEN.isEmpty {
-                LiveDebug.log("FINAL onLine isFinal=true EN=\"\(finalEN)\"")
-                configuration.onLine?(finalEN, true)
+                LiveDebug.log("FINAL onLine isFinal=true seq=\(entry.seq) EN=\"\(finalEN)\"")
+                configuration.onLine?(finalEN, true, entry.seq)
             }
             rolling.with {
                 $0.history.append(HighQualityAcceptedTranslationPair(
@@ -1113,7 +1190,7 @@ struct LiveEngine: Sendable {
                     }
                     if let s = utteranceStart {
                         let previewWork = rolling.with {
-                            $0.coordinator.observe(speechStart: s, availableThrough: available)
+                            $0.coordinator.observe(speechStart: s, availableThrough: available, seq: phraseSeq)
                         }
                         if let work = previewWork {
                             startQwenPreviewTask(work)
@@ -1144,7 +1221,10 @@ struct LiveEngine: Sendable {
                     utteranceStart = nil
                     advanceRollingState(past: lastCommit..<available)
                     lastCommit = available
-                    previewTask?.markCommitted(throughSample: lastCommit)
+                    // La phrase en cours (séquence courante) est consommée :
+                    // la phrase SUIVANTE démarre à la séquence courante + 1.
+                    phraseSeq += 1
+                    previewTask?.markCommitted(throughSample: lastCommit, seq: phraseSeq)
                     await trimCapture(upTo: lastCommit, fifo: fifo)
                     continue
                 }
@@ -1159,7 +1239,8 @@ struct LiveEngine: Sendable {
                     windowEnd: available,
                     forced: decision == .forced,
                     asrContext: asrContext,
-                    stagedUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+                    stagedUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds,
+                    seq: phraseSeq
                 )
                 await fifo.stage(entry)
                 let stagedCount = await fifo.pendingCount()
@@ -1167,7 +1248,7 @@ struct LiveEngine: Sendable {
                     "ENDPOINTING(fifo) fenêtre stagée "
                     + "[\(String(format: "%.1f", Double(lastCommit) / sr))"
                     + "–\(String(format: "%.1f", Double(available) / sr)) s] "
-                    + "(\(stagedCount) en attente)"
+                    + "(seq \(phraseSeq), \(stagedCount) en attente)"
                 )
                 // La passe de qualité (ASR → aligneur → MLX) s'exécute dans le
                 // worker de commit (dans l'ordre) — la boucle et les previews
@@ -1176,7 +1257,12 @@ struct LiveEngine: Sendable {
                 utteranceStart = nil
                 advanceRollingState(past: lastCommit..<available)
                 lastCommit = available
-                previewTask?.markCommitted(throughSample: lastCommit)
+                // La phrase ENGAGÉE porte la séquence courante ; la phrase
+                // SUIVANTE démarre à la suite (les previews en retard de la
+                // phrase engagée — séquence inférieure — seront jetées par la
+                // superposition).
+                phraseSeq += 1
+                previewTask?.markCommitted(throughSample: lastCommit, seq: phraseSeq)
                 await trimCapture(upTo: lastCommit, fifo: fifo)
                 continue
             }
@@ -1215,6 +1301,9 @@ struct LiveEngine: Sendable {
                 do {
                     let translateStarted = Date()
                     let chunkCounter = OSAllocatedUnfairLock(initialState: 0)
+                    // Capture locale (le closure @Sendable ne capture pas
+                    // le `var phraseSeq` de la boucle — avertissement Swift 6).
+                    let commitSeq = phraseSeq
                     enText = try await translator.translateLive(
                         japanese: jaText,
                         glossary: glossary,
@@ -1224,7 +1313,7 @@ struct LiveEngine: Sendable {
                             if !chunk.isEmpty {
                                 let n = chunkCounter.withLock { $0 += 1; return $0 }
                                 LiveDebug.log("MLX chunk #\(n) (preview cumulée) = \"\(chunk)\"")
-                                configuration.onLine?(chunk, false)
+                                configuration.onLine?(chunk, false, commitSeq)
                                 Task {
                                     await output.showPreview("\(LiveFormat.timecode(startSeconds)) ~ \(chunk)")
                                 }
@@ -1254,12 +1343,15 @@ struct LiveEngine: Sendable {
             // Superposition : engagement du final EN (ou JA si sans-traduction).
             let finalEN = enText ?? (configuration.sansTraduction ? jaText : "")
             if !finalEN.isEmpty {
-                LiveDebug.log("FINAL onLine isFinal=true EN=\"\(finalEN)\"")
-                configuration.onLine?(finalEN, true)
+                LiveDebug.log("FINAL onLine isFinal=true seq=\(phraseSeq) EN=\"\(finalEN)\"")
+                configuration.onLine?(finalEN, true, phraseSeq)
             }
 
             lastCommit = cut
-            previewTask?.markCommitted(throughSample: lastCommit)
+            // L'énoncé engagé porte la séquence courante ; le suivant démarre
+            // à la suite (les previews en retard de l'engagé sont jetées).
+            phraseSeq += 1
+            previewTask?.markCommitted(throughSample: lastCommit, seq: phraseSeq)
             if lastCommit >= Int(120 * LiveEndpointing.sampleRate) {
                 capture.trim(upTo: lastCommit)
             }
@@ -1289,6 +1381,10 @@ struct LiveEngine: Sendable {
                 // morceaux.
                 let chunkSize = Int(6.0 * LiveEndpointing.sampleRate)
                 var cursor = lastCommit
+                // Chaque morceau est une « phrase » à part : séquences
+                // croissantes (la phrase en cours au moment de l'arrêt porte
+                // la séquence courante).
+                var drainSeq = phraseSeq
                 while remaining - cursor >= Int(0.5 * LiveEndpointing.sampleRate) {
                     let end = min(cursor + chunkSize, remaining)
                     let windowAudio = capture.samples(from: cursor, upTo: end)
@@ -1330,7 +1426,10 @@ struct LiveEngine: Sendable {
                             english: enText,
                             show: configuration.show
                         )
-                        if !finalEN.isEmpty { configuration.onLine?(finalEN, true) }
+                        if !finalEN.isEmpty {
+                            configuration.onLine?(finalEN, true, drainSeq)
+                            drainSeq += 1
+                        }
                         // État roulant entre morceaux (contexte du morceau
                         // suivant + historique LLM).
                         rolling.with {
@@ -1368,7 +1467,9 @@ struct LiveEngine: Sendable {
                 show: configuration.show
             )
             let finalEN = enText ?? (configuration.sansTraduction ? jaText : "")
-            if !finalEN.isEmpty { configuration.onLine?(finalEN, true) }
+            if !finalEN.isEmpty {
+                configuration.onLine?(finalEN, true, phraseSeq)
+            }
         }
 
         // --- Arrêt propre ----------------------------------------------------

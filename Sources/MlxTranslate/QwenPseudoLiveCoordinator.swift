@@ -20,6 +20,12 @@ enum QwenPseudoLiveCadence: Int, CaseIterable, Sendable {
 struct QwenPseudoLivePreviewWork: Equatable, Sendable {
     let generation: Int
     let range: Range<Int>
+    /// Numéro de séquence de la phrase EN COURS au moment de l'observe
+    /// (croissant ; le work coalescé garde le seq de SON observe — une
+    /// chaîne de work ne traverse jamais un commit, le coordinateur
+    /// bloque les previews sur `stageFinal`). `var` (défaut -1) pour que
+    /// l'initialiseur memberwise le porte ; immuable après construction.
+    var seq: Int = -1
 }
 
 /// Travail final (commit de la clause : le range est définitif, les previews
@@ -88,9 +94,13 @@ struct QwenPseudoLiveCoordinator: Sendable {
 
     /// Observe l'état courant ; renvoie un travail de preview à transcrire
     /// si la cadence est atteinte et que la fenêtre n'est pas bloquée.
+    /// - `seq` : numéro de la phrase en cours (compteur du moteur) — porté
+    ///   par le work pour que la superposition distingue les previews de la
+    ///   phrase engagée de ceux de la phrase suivante.
     mutating func observe(
         speechStart: Int,
-        availableThrough: Int
+        availableThrough: Int,
+        seq: Int = -1
     ) -> QwenPseudoLivePreviewWork? {
         guard previewsEnabled,
               !isCancelled,
@@ -108,7 +118,8 @@ struct QwenPseudoLiveCoordinator: Sendable {
         lastRequestedEnd = availableThrough
         let work = QwenPseudoLivePreviewWork(
             generation: generation,
-            range: phraseStart..<availableThrough
+            range: phraseStart..<availableThrough,
+            seq: seq
         )
         latestRequestedRange = work.range
         guard inFlight == nil, pendingFinals.isEmpty else {
