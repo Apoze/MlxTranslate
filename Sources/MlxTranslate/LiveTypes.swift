@@ -50,11 +50,14 @@ enum LiveEndpointing {
 }
 
 /// Source de la ligne roulante EN (mode Qwen) :
-/// - `.apple` (défaut produit) : snapshot cumulé Qwen + traduction Apple
-///   basse latence (~250 ms, session chaude) — la ligne bouge à chaque cycle,
-///   sans dérive. Les finaux restent MLX (glossaire + historique roulant).
-/// - `.mlx` : streaming progressif du modèle MLX (glossaire inclus) — option
-///   plus lente (1,5–2,6 s par passe), activable (`--preview-source mlx`).
+/// - `.apple` (défaut produit) : ASR Apple `Speech` en streaming (JA
+///   cumulatif dans la phrase) + traduction Apple basse latence, cadence
+///   250 ms — la ligne bouge à chaque rafraîchissement, sans dérive ; elle
+///   alimente aussi la détection de fin de phrase (ponctuation). Les finaux
+///   restent MLX (glossaire + historique roulant).
+/// - `.mlx` : streaming progressif du modèle MLX (glossaire inclus, snapshots
+///   cumulatifs Qwen à cadence 1/2/3 s) — option plus lente (1,5–2,6 s par
+///   passe), activable (`--preview-source mlx`).
 public enum LivePreviewMode: String, CaseIterable, Sendable {
     case apple
     case mlx

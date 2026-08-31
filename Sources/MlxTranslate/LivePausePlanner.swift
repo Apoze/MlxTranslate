@@ -2,15 +2,19 @@ import Foundation
 
 /// Endpointing live « lâche » (port 1:1 des règles de WhisperASR
 /// `LocalEndpointPlanner`) : on commit dès qu'un silence de
-/// `pauseSilenceSeconds` suit la phrase (≥ `minimumBatchSeconds`), avec un
-/// filet dur à 15 s. La fenêtre reste courte, la preview bouge à chaque cycle
-/// et le final arrive dès que le locuteur s'arrête — pas d'attente de 2 s, pas
-/// de forçage à 12 s sur audio silencieux.
+/// `pauseSilenceSeconds` suit la phrase (≥ `minimumBatchSeconds`), dès la fin
+/// de phrase détectée dans le texte roulant (ponctuation terminale / fin
+/// japonaise conservatrice), avec un filet dur à 5 s. La fenêtre reste
+/// courte, la preview bouge à chaque cycle et le final arrive dès que le
+/// locuteur s'arrête — pas d'attente de 2 s, pas de forçage à 12 s sur audio
+/// silencieux.
 ///
 /// Structure pure (testable table-driven), espace échantillons 16 kHz
 /// (indices absolus). Port de WhisperASR adapté à MlxTranslate :
 /// - détection de silence = `LiveSemanticEndpointer.trailingSilenceSeconds`
 ///   (RMS, seuil partagé) — fournie par le moteur à chaque observation ;
+/// - fin de phrase = `LiveSemanticEndpointer.isTerminalJapanese` sur le texte
+///   roulant (Apple par défaut, snapshot Qwen en mode `.mlx`) ;
 /// - pas de `preRoll` (la fenêtre démarre au dernier commit).
 struct LivePausePlanner: Sendable {
     /// Silence (s) après la dernière parole → commit de la phrase
@@ -19,15 +23,18 @@ struct LivePausePlanner: Sendable {
     /// Durée minimale (s) de la fenêtre avant qu'un silence ne puisse commiter
     /// (regroupe les phrases courtes).
     static let minimumBatchSeconds = 1.5
-    /// Plafond dur (s) de la fenêtre, quel que soit le silence (WhisperASR :
-    /// `maxPhrase = 15 s`).
-    static let maxPhraseSeconds = 15.0
+    /// Filet dur (s) de la fenêtre, quel que soit le silence : purge des
+    /// lots anciens (le spool avance, la détection continue — rien n'est
+    /// perdu).
+    static let maxPhraseSeconds = 5.0
 
     /// Verdict sur la fenêtre courante.
     enum Decision: Equatable, Sendable {
-        /// Silence de 0,5 s après une phrase ≥ 1,5 s → commit.
+        /// Silence de 0,5 s après une phrase ≥ 1,5 s, OU fin de phrase
+        /// détectée dans le texte roulant (ponctuation terminale / fin
+        /// japonaise conservatrice) → commit.
         case pause
-        /// Fenêtre ≥ 15 s → coupure de sécurité.
+        /// Fenêtre ≥ 5 s → coupure de sécurité (filet).
         case forced
     }
 
@@ -44,24 +51,34 @@ struct LivePausePlanner: Sendable {
     ///     (0 = la parole est encore en cours).
     ///   - speechStart: début (échantillon absolu) de la PREMIÈRE parole dans
     ///     la fenêtre courante (nil = aucune parole dans la fenêtre).
+    ///   - latestText: texte roulant courant (segment Apple / snapshot Qwen) —
+    ///     une fin terminale (ponctuation) commite immédiatement, sans
+    ///     attendre le silence ni la durée minimale de lot.
     mutating func observe(
         windowStart: Int,
         available: Int,
         trailingSilenceSeconds: Double,
-        speechStart: Int?
+        speechStart: Int?,
+        latestText: String? = nil
     ) -> Decision? {
         if let start = speechStart {
             phraseSpeechStart = min(phraseSpeechStart ?? start, start)
         }
-        // Filet : fenêtre ≥ 15 s → coupure de sécurité (même à vide — la coupe
+        // Filet : fenêtre ≥ 5 s → coupure de sécurité (même à vide — la coupe
         /// vide fait avancer `lastCommit`, pas d'accumulation sans borne).
         if Double(available - windowStart) / LiveEndpointing.sampleRate >= Self.maxPhraseSeconds {
             return .forced
         }
         guard let start = phraseSpeechStart else { return nil }
-        // Phrase elle-même ≥ 15 s (parole continue) → coupure de sécurité.
+        // Phrase elle-même ≥ 5 s (parole continue) → coupure de sécurité.
         if Double(available - start) / LiveEndpointing.sampleRate >= Self.maxPhraseSeconds {
             return .forced
+        }
+        // Fin de phrase dans le texte roulant (ponctuation terminale ou fin
+        // japonaise conservatrice) → commit immédiat — l'accumulation s'arrête
+        // à la fin de la phrase, pas seulement au silence.
+        if let latestText, LiveSemanticEndpointer.isTerminalJapanese(latestText) {
+            return .pause
         }
         // Silence de 0,5 s après une phrase ≥ 1,5 s → commit.
         if trailingSilenceSeconds >= Self.pauseSilenceSeconds,

@@ -38,7 +38,7 @@ struct Command {
     /// latence (défaut) ou MLX streaming (option lente, glossaire).
     var livePreviewSource: LivePreviewMode = .productDefault
     /// Modèle EN du live : `--modele` explicite, sinon le défaut live
-    /// (qwen3-1.7b — distinct du défaut offline, `model`).
+    /// (qwen3-4b — distinct du défaut offline, `model`).
     var liveModel: LocalMLXTranslator.Candidate = .productDefault
     // Bench (inspection RAM / latence / qualité — pas le produit)
     var benchSansApple: Bool = false
@@ -90,7 +90,7 @@ enum CLIParser {
               live --app <bundleID|nom>                capture l'audio de l'application
                 --sans-preview                         pas de preview (traduction finale seule)
                 --sans-traduction                      JA seul (pas de traduction EN finale)
-                --modele <id>                          modèle EN (défaut live : qwen3-1.7b ;
+                --modele <id>                          modèle EN (défaut live : qwen3-4b ;
                                                        `--modele qwen3-8b` force le 8b, etc.)
                 --cadence 1|2|3                        cadence des snapshots roulants Qwen en
                                                        secondes (défaut : 2 ; prise en compte
@@ -137,7 +137,7 @@ enum CLIParser {
         var listApps = false
         var liveCadence = QwenPseudoLiveCadence.productDefault
         var livePreviewSource = LivePreviewMode.productDefault
-        // `--modele` explicit (live) : sinon le défaut live (qwen3-1.7b) s'applique
+        // `--modele` explicit (live) : sinon le défaut live (qwen3-4b) s'applique
         // indépendamment du défaut offline (qwen3-8b).
         var modelExplicit = false
         var benchSansApple = false
@@ -275,10 +275,10 @@ enum CLIParser {
         if selectedVerb == .live {
             // `live` n'a pas de média positionnel : l'app vient de `--app`.
             let videoURL = video ?? URL(fileURLWithPath: app ?? "live")
-            // Modèle EN par défaut du live : qwen3-1.7b (mesuré : TTFC 0,44 s,
-            // +0,98 GB RAM — adapté aux previews rapides) ; `--modele` reste
-            // disponible pour forcer un autre candidat (qwen3-8b, qwen3-4b…).
-            let liveModel: LocalMLXTranslator.Candidate = modelExplicit ? model : .qwen3_1B7
+            // Modèle EN par défaut du live : qwen3-4b (testé : qualité
+            // supérieure au 1.7b, sans ralentissement ressenti) ; `--modele`
+            // reste disponible pour forcer un autre candidat (qwen3-8b…).
+            let liveModel: LocalMLXTranslator.Candidate = modelExplicit ? model : .qwen3_4B
             return Command(
                 verb: .live,
                 video: videoURL,

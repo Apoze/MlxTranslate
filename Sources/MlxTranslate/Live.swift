@@ -254,14 +254,17 @@ final class LivePreviewTask: @unchecked Sendable {
         } catch { /* best-effort */ }
     }
 
-    // Traduction throttlée (≥ 0,7 s et texte changé) du texte roulant → EN bas.
-    // L'horodatage affiché est le DÉBUT de l'énoncé en cours (aligné sur le
-    // final/SRT), pas la position courante : les previews et les cues SRT
-    // utilisent alors la même base temporelle.
+    // Traduction throttlée (≥ 0,25 s et texte changé) du texte roulant → EN
+    // bas : cadence 250 ms (plan produit) — la ligne se met à jour à chaque
+    // rafraîchissement, s'améliore à chaque résultat progressif du
+    // transcribeur (cumulatif dans la phrase), et le final MLX (glossaire) la
+    // remplace au commit. L'horodatage affiché est le DÉBUT de l'énoncé en
+    // cours (aligné sur le final/SRT), pas la position courante : les
+    // previews et les cues SRT utilisent alors la même base temporelle.
     private func renderPreview() async {
         let ja = jaLock.withLock { rollingJA }
         guard ja != lastTranslatedJA,
-              Date().timeIntervalSince(lastTranslateTime) >= 0.7,
+              Date().timeIntervalSince(lastTranslateTime) >= 0.25,
               !ja.isEmpty else { return }
         do {
             let started = Date()
@@ -292,6 +295,13 @@ final class LivePreviewTask: @unchecked Sendable {
             finalizedThroughSampleLocked = update.finalizedThroughSample
         }
         jaLock.unlock()
+    }
+
+    /// Texte roulant japonais (segment courant, cumulatif dans la phrase) —
+    /// lu par le moteur pour le planificateur d'endpointing (fin de phrase
+    /// par ponctuation → commit immédiat, sans attendre le silence).
+    var rollingText: String {
+        jaLock.withLock { rollingJA }
     }
 
     /// Borne de finalisation Apple (échantillons 16 kHz, index absolu) — le
@@ -334,8 +344,9 @@ struct LiveEngineConfiguration: Sendable {
     /// Cadence des snapshots cumulatifs (1 / 2 / 3 s) — prise en compte au
     /// démarrage du live (redémarrage requis pour changer la valeur).
     var pseudoLiveCadence: QwenPseudoLiveCadence = .productDefault
-    /// Source de la ligne roulante EN (mode Qwen) : Apple basse latence
-    /// (défaut produit, ~250 ms) ou MLX streaming (option lente, glossaire).
+    /// Source de la ligne roulante EN (mode Qwen) : Apple `Speech` en
+    /// streaming (défaut produit, ASR cumulé + traduction 250 ms) ou MLX
+    /// streaming (option lente, glossaire, snapshots cumulatifs 1/2/3 s).
     var previewMode: LivePreviewMode = .productDefault
     // Instances préchargées (GUI : modèles chargés au lancement de l'app) —
     // les `prepare` sont idempotents : déjà préparées, le live démarre sans
@@ -488,15 +499,15 @@ struct LiveEngine: Sendable {
         } else {
             translation = AppleTranslationService()
         }
-        // Ligne roulante Apple (Speech JA → traduction Apple) : active en mode
-        // legacy (Voxtral) et en mode Qwen avec pseudo-live DÉSACTIVÉ
-        // (MLXTRANSLATE_PSEUDO_LIVE=0). En mode Qwen + pseudo-live (défaut
-        // produit), la roulante est la tâche Qwen (snapshot cumulé +
-        // traduction Apple basse latence, ou MLX streaming selon
-        // `previewMode`) — pas de second transcribeur (WhisperASR : mode
-        // qwenPseudoLiveApple).
+        // Ligne roulante Apple (Speech JA streaming, cumulatif, → traduction
+        // Apple 250 ms) : active en mode legacy (Voxtral) et en mode Qwen
+        // avec `previewMode == .apple` (DÉFAUT PRODUIT) — l'ASR Apple
+        // alimente la ligne live (rapide, cumulative) et la détection de fin
+        // de phrase (ponctuation) ; le final (Qwen3-ASR + MLX glossaire) la
+        // remplace au commit. En mode Qwen `.mlx` (option lente), la roulante
+        // est la tâche Qwen (snapshots cumulatifs + streaming MLX).
         let appleRollingPreview = configuration.preview
-            && (configuration.liveASR == .qwenJA ? !configuration.pseudoLive : true)
+            && (configuration.liveASR == .qwenJA ? configuration.previewMode == .apple : true)
         // Glossaire : chargé AVANT le preview pour injecter les formes JA comme
         // « context strings » du transcribeur Apple (bias lexical des termes
         // propres) ; il alimente aussi la traduction (prompt + contexte roulant).
@@ -592,11 +603,13 @@ struct LiveEngine: Sendable {
         try await translator.prepare { _, _ in }
 
         // --- Boucle d'endpointing + finalisation ---------------------------
+        let sr = LiveEndpointing.sampleRate
         var lastCommit = 0
         var stopRequested = false
-        // Endpointing « lâche » (règles WhisperASR) : commit dès le silence de
-        // 0,5 s après une phrase ≥ 1,5 s, filet dur à 15 s — la fenêtre reste
-        // courte et la preview bouge à chaque cycle.
+        // Endpointing « lâche » (règles WhisperASR) : commit au silence de
+        // 0,5 s après une phrase ≥ 1,5 s, à la FIN DE PHRASE (silence OU
+        // ponctuation dans le texte roulant), filet dur à 5 s — la fenêtre
+        // reste courte et la preview bouge à chaque cycle.
         var pausePlanner = LivePausePlanner()
         // État partagé avec la tâche de preview Qwen (non bloquante) :
         // snapshot cumulé, dédup des passes MLX, historique LLM roulant (K=4),
@@ -605,7 +618,9 @@ struct LiveEngine: Sendable {
         let rolling = LiveRollingState(
             coordinator: QwenPseudoLiveCoordinator(
                 cadence: configuration.pseudoLiveCadence,
-                previewsEnabled: useQwenFinal && configuration.pseudoLive
+                previewsEnabled: useQwenFinal
+                    && configuration.pseudoLive
+                    && configuration.previewMode == .mlx
             )
         )
         // Début de la phrase EN COURS (première parole après le dernier
@@ -799,6 +814,190 @@ struct LiveEngine: Sendable {
             }
         }
 
+        /// Trim borné du spool : ne libère JAMAIS le PCM d'une fenêtre FIFO
+        /// encore en attente (le consommateur lit `samples(from:upTo:)` au
+        /// traitement, pas au staging) — sinon trim normal à `commit`.
+        func trimCapture(upTo commit: Int, fifo: LiveEndpointFIFO) async {
+            guard commit >= Int(120 * sr) else { return }
+            let oldest = await fifo.oldestPendingWindowStart()
+            capture.trim(upTo: min(commit, oldest ?? commit))
+        }
+
+        /// Passe de qualité d'une fenêtre FIFO (ASR → aligneur → MLX →
+        /// commit) — exécutée par le worker de commit (dans l'ordre, les
+        /// plus anciennes d'abord) ; la boucle d'endpointing ne bloque
+        /// JAMAIS dessus (port WhisperASR : le producteur stage, le
+        /// consommateur commit).
+        func processFIFOCommit(_ entry: LiveEndpointFIFO.Entry) async throws {
+            guard let asrFinal, let alignerRT else {
+                throw LiveError.finalASR("FIFO : ASR final / aligneur non prêts")
+            }
+            let windowAudio = capture.samples(from: entry.windowStart, upTo: entry.windowEnd)
+            guard !windowAudio.isEmpty else {
+                throw LiveError.finalASR("FIFO : fenêtre vide (PCM libéré ?)")
+            }
+            let asrStarted = Date()
+            let rawJA = try await asrFinal.transcribe(
+                audio: windowAudio,
+                context: entry.asrContext.isEmpty ? nil : entry.asrContext
+            )
+            LiveDebug.log(
+                "ASR(Qwen3) commit \"\(rawJA)\" "
+                + "(\(String(format: "%.0f", Date().timeIntervalSince(asrStarted) * 1000)) ms, "
+                + "\(String(format: "%.1f", Double(windowAudio.count) / sr)) s d'audio)"
+            )
+            // Repli des répétitions dégénérées (musique/silence) avant
+            // alignement/traduction — le texte brut reste journalisé.
+            let collapsedJA = LiveRepetition.collapse(
+                rawJA.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            guard let jaText = LiveClauseSelection.select(
+                qwenJapanese: collapsedJA, appleJapanese: nil
+            ) else {
+                // ASR vide (bruit) : avancement sans cue (le spool avance,
+                // la phrase suivante repart proprement).
+                LiveDebug.log("ENDPOINTING(fifo) ASR vide — avancement sans cue")
+                return
+            }
+
+            // Alignement : borne exacte de consommation (zéro dérive) — le
+            // cue se termine à la fin du dernier mot. Repli : fin de fenêtre
+            // − garde de stabilité (1,12 s).
+            var cueEnd = max(
+                entry.windowStart,
+                entry.windowEnd - Int(LiveSemanticEndpointer.stabilityGuardSeconds * sr)
+            )
+            if let aligned = try? await alignerRT.align(audio: windowAudio, text: jaText),
+               let lastWord = aligned.last, lastWord.startTime > 0 {
+                cueEnd = min(
+                    max(entry.windowStart + Int(lastWord.endTime * Float(sr)), entry.windowStart),
+                    entry.windowEnd
+                )
+            }
+            if cueEnd <= entry.windowStart { cueEnd = entry.windowEnd }
+            LiveDebug.log(
+                "ENDPOINTING(fifo) commit [\(String(format: "%.1f", Double(entry.windowStart) / sr))"
+                + "–\(String(format: "%.1f", Double(cueEnd) / sr)) s] "
+                + "JA=\"\(jaText)\""
+            )
+
+            // Traduction finale (MLX, glossaire + historique roulant K=4,
+            // streaming) — la passe de qualité : la ligne était « en cours »
+            // (preview) jusqu'ici ; le final la remplace.
+            let isFragment = entry.forced || !LiveSemanticEndpointer.isTerminalJapanese(jaText)
+            var enText: String?
+            let windowStartSeconds = Double(entry.windowStart) / sr
+            if !configuration.sansTraduction {
+                do {
+                    let translateStarted = Date()
+                    let chunkCounter = OSAllocatedUnfairLock(initialState: 0)
+                    let finalHistory = rolling.with {
+                        Array($0.history.suffix(LiveSemanticEndpointer.historyLimit))
+                    }
+                    enText = try await translator.translateLive(
+                        japanese: jaText,
+                        glossary: glossary,
+                        history: finalHistory,
+                        // Filet 5 s OU clause incomplète → « ne pas compléter
+                        // ni deviner ».
+                        isFragment: isFragment,
+                        sourceStart: windowStartSeconds,
+                        sourceEnd: Double(cueEnd) / sr,
+                        onChunk: { chunk in
+                            if !chunk.isEmpty {
+                                let n = chunkCounter.withLock { $0 += 1; return $0 }
+                                LiveDebug.log("MLX chunk #\(n) (preview cumulée) = \"\(chunk)\"")
+                                configuration.onLine?(chunk, false)
+                                Task {
+                                    await output.showPreview(
+                                        "\(LiveFormat.timecode(windowStartSeconds)) ~ \(chunk)"
+                                    )
+                                }
+                            }
+                        }
+                    )
+                    if enText?.isEmpty == true { enText = nil }
+                    let chunkTotal = chunkCounter.withLock { $0 }
+                    LiveDebug.log(
+                        "TRAD(MLX) FINAL EN=\"\(enText ?? "")\" "
+                        + "(\(String(format: "%.0f", Date().timeIntervalSince(translateStarted) * 1000)) ms, \(chunkTotal) chunks)"
+                    )
+                } catch {
+                    Pipeline.log("traduction EN en échec : \(error.localizedDescription)")
+                    LiveDebug.log("TRAD(MLX) échec : \(error.localizedDescription)")
+                }
+            }
+
+            // Engagement + état roulant (historique LLM, contexte ASR) — le
+            // worker commit dans l'ordre (les plus anciennes d'abord), la
+            // cohérence SRT et historique est préservée.
+            let finalEN = enText ?? (configuration.sansTraduction ? jaText : "")
+            await output.clearPreview()
+            await output.commit(
+                start: windowStartSeconds,
+                end: Double(cueEnd) / sr,
+                japanese: jaText,
+                english: enText,
+                show: configuration.show
+            )
+            if !finalEN.isEmpty {
+                LiveDebug.log("FINAL onLine isFinal=true EN=\"\(finalEN)\"")
+                configuration.onLine?(finalEN, true)
+            }
+            rolling.with {
+                $0.history.append(HighQualityAcceptedTranslationPair(
+                    cueID: "live-\($0.history.count)",
+                    japanese: jaText,
+                    english: finalEN.isEmpty ? jaText : finalEN
+                ))
+                $0.history = Array($0.history.suffix(LiveSemanticEndpointer.historyLimit))
+                $0.committedJA += " \(jaText)"
+            }
+        }
+
+        // --- Worker de commit (consommateur de la FIFO) -------------------
+        // Port WhisperASR (`consumePrototypeEndpoints`) : la boucle d'endpointing
+        // STAGE les fenêtres (non bloquant), le worker les traite dans l'ordre
+        // (les plus anciennes d'abord) — la passe de qualité (ASR → aligneur →
+        // MLX, ~1,5–2,6 s) ne bloque jamais l'endpointing ni les previews.
+        // Un échec reste en tête de file (« Audio retained — retrying oldest
+        // phrase… », 2 tentatives) ; le spool n'avance que sur fenêtre
+        // acceptée.
+        let fifo = LiveEndpointFIFO()
+        let commitWorker = Task {
+            var attempts = 0
+            while true {
+                guard let entry = await fifo.next() else {
+                    let stopping = stopLock.withLock({ $0 }) || configuration.stopRequested()
+                    // Arrêt + file vide → drain terminé. Arrêt + file non vide
+                    // → on draine le reste (les cues stagées ne sont pas perdus).
+                    let drained = await fifo.isDrained()
+                    if stopping && drained { return }
+                    try? await Task.sleep(for: .milliseconds(40))
+                    continue
+                }
+                do {
+                    try await processFIFOCommit(entry)
+                    await fifo.accept(entry)
+                    attempts = 0
+                } catch {
+                    attempts += 1
+                    LiveDebug.log(
+                        "ENDPOINTING(fifo) Audio retained — retrying oldest phrase… "
+                        + "(tentative \(attempts)) : \(error.localizedDescription)"
+                    )
+                    // Deux échecs sur la même fenêtre : on la libère pour
+                    // débloquer la file (le PCM reste en spool, la suite suit
+                    // — sémantique « retained » de WhisperASR, adaptée au live).
+                    if attempts >= 2 {
+                        await fifo.accept(entry)
+                        attempts = 0
+                    }
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+            }
+        }
+
         let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         source.setEventHandler {
             stopLock.withLock { $0 = true }
@@ -812,11 +1011,10 @@ struct LiveEngine: Sendable {
             let available = capture.sampleCount()
 
             if useQwenFinal, let asrFinal, let alignerRT {
-                // --- Endpointing « lâche » (WhisperASR) + preview Qwen
-                //     (non bloquante) : la boucle décide, la tâche alimente
-                //     la ligne roulante -------------------------------
-                guard available - lastCommit >= Int(0.5 * LiveEndpointing.sampleRate) else { continue }
-                let sr = LiveEndpointing.sampleRate
+                // --- Endpointing « lâche » (WhisperASR) + commit non
+                //     bloquant (FIFO) : la boucle décide et STAGE, le worker
+                //     de commit exécute la passe de qualité -----------------
+                guard available - lastCommit >= Int(0.5 * sr) else { continue }
 
                 // VAD de la fenêtre (RMS, seuil partagé) : silence de fin +
                 // première parole (échantillon absolu).
@@ -825,11 +1023,17 @@ struct LiveEngine: Sendable {
                 let silenceSeconds = LiveSemanticEndpointer.trailingSilenceSeconds(tail)
                 let speechStart = LivePausePlanner.firstSpeechSample(samples: tail, windowStart: scanStart)
 
+                // Fin de phrase par PONCTUATION dans le texte roulant (segment
+                // Apple en mode `.apple` — défaut — ou snapshot Qwen en
+                // `.mlx`) : le commit ne attend pas le silence, l'accumulation
+                // s'arrête à la fin de la phrase.
+                let latestText = previewTask?.rollingText ?? rolling.with { $0.snapshot }
                 let decision = pausePlanner.observe(
                     windowStart: lastCommit,
                     available: available,
                     trailingSilenceSeconds: silenceSeconds,
-                    speechStart: speechStart
+                    speechStart: speechStart,
+                    latestText: latestText
                 )
 
                 // Preview roulante (non bloquante) : tant que le planner
@@ -858,11 +1062,17 @@ struct LiveEngine: Sendable {
                     continue
                 }
 
-                // --- Commit (pause 0,5 s ou filet 15 s) -------------------
+                // --- Commit : STAGE dans la FIFO (non bloquant) -------------------
+                // Port WhisperASR (LocalEndpointFIFO) : la boucle ne fait que
+                // STAGER la fenêtre — la passe de qualité (ASR → aligneur →
+                // MLX) s'exécute dans le worker de commit, dans l'ordre (les
+                // plus anciennes d'abord). Le PCM reste en spool (trim borné
+                // par la plus ancienne fenêtre en attente) — rien n'est perdu
+                // si le worker est en retard.
                 LiveDebug.log(
                     "ENDPOINTING(planner) \(decision == .forced ? "forceCut" : "pause") "
                     + "silence=\(String(format: "%.1f", silenceSeconds)) s "
-                    + "(\(String(format: "%.1f", Double(available - lastCommit) / sr)) s de fenêtre)"
+                    + "(\(String(format: "%.1f", Double(available - lastCommit) / sr)) s de fenêtre) → FIFO"
                 )
                 let windowAudio = capture.samples(from: lastCommit, upTo: available)
                 // Garde des vides : fenêtre sans parole (musique/silence) →
@@ -872,155 +1082,40 @@ struct LiveEngine: Sendable {
                     LiveDebug.log("ENDPOINTING(planner) fenêtre vide — avancement sans cue")
                     pausePlanner.reset()
                     utteranceStart = nil
-                    utteranceStart = nil
-                    utteranceStart = nil
                     advanceRollingState(past: lastCommit..<available)
                     lastCommit = available
                     previewTask?.committedSampleOffset = lastCommit
-                    if lastCommit >= Int(120 * sr) {
-                        capture.trim(upTo: lastCommit)
-                    }
+                    await trimCapture(upTo: lastCommit, fifo: fifo)
                     continue
                 }
 
                 let asrContext = rolling.with {
                     String($0.committedJA.suffix(LiveSemanticEndpointer.asrContextCharacters))
                 }
-                let asrStarted = Date()
-                let rawJA = (try? await asrFinal.transcribe(
-                    audio: windowAudio,
-                    context: asrContext.isEmpty ? nil : asrContext
-                )) ?? ""
+                let entry = LiveEndpointFIFO.Entry(
+                    windowStart: lastCommit,
+                    windowEnd: available,
+                    forced: decision == .forced,
+                    asrContext: asrContext,
+                    stagedUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+                )
+                await fifo.stage(entry)
+                let stagedCount = await fifo.pendingCount()
                 LiveDebug.log(
-                    "ASR(Qwen3) commit \"\(rawJA)\" "
-                    + "(\(String(format: "%.0f", Date().timeIntervalSince(asrStarted) * 1000)) ms, "
-                    + "\(String(format: "%.1f", Double(windowAudio.count) / sr)) s d'audio)"
+                    "ENDPOINTING(fifo) fenêtre stagée "
+                    + "[\(String(format: "%.1f", Double(lastCommit) / sr))"
+                    + "–\(String(format: "%.1f", Double(available) / sr)) s] "
+                    + "(\(stagedCount) en attente)"
                 )
-                // Repli des répétitions dégénérées (musique/silence) avant
-                // alignement/traduction — le texte brut reste journalisé.
-                let collapsedJA = LiveRepetition.collapse(
-                    rawJA.trimmingCharacters(in: .whitespacesAndNewlines)
-                )
-                guard let jaText = LiveClauseSelection.select(
-                    qwenJapanese: collapsedJA, appleJapanese: nil
-                ) else {
-                    // ASR vide (bruit) : avancer sans cue.
-                    LiveDebug.log("ENDPOINTING(planner) ASR vide — avancement sans cue")
-                    pausePlanner.reset()
-                    utteranceStart = nil
-                    utteranceStart = nil
-                    advanceRollingState(past: lastCommit..<available)
-                    lastCommit = available
-                    previewTask?.committedSampleOffset = lastCommit
-                    if lastCommit >= Int(120 * sr) {
-                        capture.trim(upTo: lastCommit)
-                    }
-                    continue
-                }
-
-                // Alignement : borne exacte de consommation (zéro dérive) —
-                // la fenêtre suivante démarre à la fin du dernier mot.
-                // Repli : fedThrough − garde de stabilité (1,12 s).
-                var nextCommit = max(
-                    lastCommit,
-                    available - Int(LiveSemanticEndpointer.stabilityGuardSeconds * sr)
-                )
-                if let aligned = try? await alignerRT.align(audio: windowAudio, text: jaText),
-                   let lastWord = aligned.last, lastWord.startTime > 0 {
-                    nextCommit = min(
-                        max(lastCommit + Int(lastWord.endTime * Float(sr)), lastCommit),
-                        available
-                    )
-                }
-                if nextCommit <= lastCommit { nextCommit = available }
-                LiveDebug.log(
-                    "ENDPOINTING(planner) commit [\(String(format: "%.1f", Double(lastCommit) / sr))"
-                    + "–\(String(format: "%.1f", Double(nextCommit) / sr)) s] "
-                    + "JA=\"\(jaText)\""
-                )
-
-                // Traduction finale (MLX, glossaire + historique roulant K=4,
-                // streaming) — la passe de qualité (bloquante, ~1,5–2,6 s) :
-                // la ligne était « en cours » (preview) jusqu'ici ; le final
-                // la remplace.
-                let isFragment = decision == .forced || !LiveSemanticEndpointer.isTerminalJapanese(jaText)
-                var enText: String?
-                let windowStartSeconds = Double(lastCommit) / sr
-                if !configuration.sansTraduction {
-                    do {
-                        let translateStarted = Date()
-                        let chunkCounter = OSAllocatedUnfairLock(initialState: 0)
-                        let finalHistory = rolling.with {
-                            Array($0.history.suffix(LiveSemanticEndpointer.historyLimit))
-                        }
-                        enText = try await translator.translateLive(
-                            japanese: jaText,
-                            glossary: glossary,
-                            history: finalHistory,
-                            // Filet 15 s OU clause incomplète → « ne pas
-                            // compléter ni deviner ».
-                            isFragment: isFragment,
-                            sourceStart: windowStartSeconds,
-                            sourceEnd: Double(nextCommit) / sr,
-                            onChunk: { chunk in
-                                if !chunk.isEmpty {
-                                    let n = chunkCounter.withLock { $0 += 1; return $0 }
-                                    LiveDebug.log("MLX chunk #\(n) (preview cumulée) = \"\(chunk)\"")
-                                    configuration.onLine?(chunk, false)
-                                    Task {
-                                        await output.showPreview(
-                                            "\(LiveFormat.timecode(windowStartSeconds)) ~ \(chunk)"
-                                        )
-                                    }
-                                }
-                            }
-                        )
-                        if enText?.isEmpty == true { enText = nil }
-                        let chunkTotal = chunkCounter.withLock { $0 }
-                        LiveDebug.log(
-                            "TRAD(MLX) FINAL EN=\"\(enText ?? "")\" "
-                            + "(\(String(format: "%.0f", Date().timeIntervalSince(translateStarted) * 1000)) ms, \(chunkTotal) chunks)"
-                        )
-                    } catch {
-                        Pipeline.log("traduction EN en échec : \(error.localizedDescription)")
-                        LiveDebug.log("TRAD(MLX) échec : \(error.localizedDescription)")
-                    }
-                }
-
-                // Engagement + état roulant (historique LLM, contexte ASR,
-                // coordinateur : le range est définitif — les previews le
-                // couvrant sont obsolètes, le preview coalescé repart sur la
-                // clause suivante immédiatement).
-                let finalEN = enText ?? (configuration.sansTraduction ? jaText : "")
-                await output.clearPreview()
-                await output.commit(
-                    start: windowStartSeconds,
-                    end: Double(nextCommit) / sr,
-                    japanese: jaText,
-                    english: enText,
-                    show: configuration.show
-                )
-                if !finalEN.isEmpty {
-                    LiveDebug.log("FINAL onLine isFinal=true EN=\"\(finalEN)\"")
-                    configuration.onLine?(finalEN, true)
-                }
-                rolling.with {
-                    $0.history.append(HighQualityAcceptedTranslationPair(
-                        cueID: "live-\($0.history.count)",
-                        japanese: jaText,
-                        english: finalEN.isEmpty ? jaText : finalEN
-                    ))
-                    $0.history = Array($0.history.suffix(LiveSemanticEndpointer.historyLimit))
-                    $0.committedJA += " \(jaText)"
-                }
+                // La passe de qualité (ASR → aligneur → MLX) s'exécute dans le
+                // worker de commit (dans l'ordre) — la boucle et les previews
+                // continuent immédiatement.
                 pausePlanner.reset()
                 utteranceStart = nil
-                advanceRollingState(past: lastCommit..<nextCommit)
-                lastCommit = nextCommit
+                advanceRollingState(past: lastCommit..<available)
+                lastCommit = available
                 previewTask?.committedSampleOffset = lastCommit
-                if lastCommit >= Int(120 * sr) {
-                    capture.trim(upTo: lastCommit)
-                }
+                await trimCapture(upTo: lastCommit, fifo: fifo)
                 continue
             }
 
@@ -1107,6 +1202,14 @@ struct LiveEngine: Sendable {
                 capture.trim(upTo: lastCommit)
             }
         }
+
+        // --- Drain de la FIFO (fenêtres stagées avant l'arrêt) ----------------
+        // Le worker traite le reste dans l'ordre (rien n'est perdu), puis
+        // termine (`isDrained`). La finalisation de l'audio restant suit —
+        // pas de double traitement (le spool a avancé jusqu'à la dernière
+        // fenêtre stagée ; seules les nouvelles arrivées sont finalisées).
+        await fifo.finishProducing()
+        await commitWorker.value
 
         // --- Finalisation de l'audio restant --------------------------------
         let remaining = capture.sampleCount()

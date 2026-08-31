@@ -14,7 +14,7 @@ final class StopFlag: @unchecked Sendable {
 }
 
 /// Préchargement des modèles du live au lancement de l'app (GUI) :
-/// ASR (Qwen3-ASR 1.7B), aligneur, traducteur EN (qwen3-1.7b — défaut du
+/// ASR (Qwen3-ASR 1.7B), aligneur, traducteur EN (qwen3-4b — défaut du
 /// live) et Apple Translation (réchauffée, ~250 ms) se chargent en arrière-
 /// plan. `startLive` RÉUTILISE ces instances (les gardes d'idempotence de
 /// `prepare`/`configure` évitent tout double chargement) — le live démarre
@@ -42,7 +42,7 @@ final class LiveModelPreloader {
         // immédiatement par `startLive`, même avant la fin du chargement.
         let asr = Qwen3ASRFinalRuntime()
         let aligner = Qwen3AlignerRuntime()
-        let translator = LocalMLXTranslator(candidate: .qwen3_1B7)
+        let translator = LocalMLXTranslator(candidate: .qwen3_4B)
         let translation = AppleTranslationService()
         self.asr = asr
         self.aligner = aligner
@@ -66,7 +66,7 @@ final class LiveModelPreloader {
 
     private func preloadFinished() {
         // Signal de journalisation (les instances sont déjà exposées).
-        MlxTranslate.LiveDebug.log("Préchargement live terminé (ASR + aligneur + qwen3-1.7b + Apple Translation)")
+        MlxTranslate.LiveDebug.log("Préchargement live terminé (ASR + aligneur + qwen3-4b + Apple Translation)")
     }
 }
 
@@ -85,10 +85,10 @@ final class AppModel: ObservableObject {
     // MARK: Live
     @Published var liveApp: String = ""
     @Published var liveApps: [CaptureApp] = []
-    /// Modèle EN du live : qwen3-1.7b par défaut (mesuré : TTFC 0,44 s,
-    /// +0,98 GB RAM — adapté aux previews rapides) ; 8b/4b/gemma restants
-    /// disponibles (le défaut offline reste qwen3-8b).
-    @Published var liveModel: LocalMLXTranslator.Candidate = .qwen3_1B7
+    /// Modèle EN du live : qwen3-4b par défaut (testé : qualité supérieure
+    /// au 1.7b, sans ralentissement ressenti ; adapté aux finaux live) ;
+    /// 8b/1.7b/gemma restent disponibles (le défaut offline reste qwen3-8b).
+    @Published var liveModel: LocalMLXTranslator.Candidate = .qwen3_4B
     /// Niveau final ASR (qwenja par défaut / voxtral legacy).
     @Published var liveASR: LiveFinalASR = .productDefault
     /// Pseudo-live Qwen (snapshots roulants de la clause en cours) —
@@ -265,9 +265,9 @@ final class AppModel: ObservableObject {
                 let preloader = LiveModelPreloader.shared
                 config.preloadedASR = preloader.asr
                 config.preloadedAligner = preloader.aligner
-                // Le traducteur préchargé est le défaut live (qwen3-1.7b) —
+                // Le traducteur préchargé est le défaut live (qwen3-4b) —
                 // on ne le réutilise que si le modèle sélectionné est le même.
-                config.preloadedTranslator = (model == .qwen3_1B7) ? preloader.translator : nil
+                config.preloadedTranslator = (model == .qwen3_4B) ? preloader.translator : nil
                 MlxTranslate.LivePreloadedTranslation.service = preloader.translation
                 // Lignes de la superposition (2 lignes, `LiveOverlayState`) :
                 // l'APERÇU roulant (Apple basse latence + snapshots Qwen)

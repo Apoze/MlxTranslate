@@ -161,9 +161,10 @@ private func runCLIParserChecks() {
         _ = try CLIParser.parse(["mlxtranslate", "live", "--cadence"])
     }
 
-    // --- Modèle EN du live : défaut 1,7B ; `--modele` explicite respecté ;
-    //     le défaut offline (8b) reste inchangé.
-    checkEqual(parse(["live", "--app", "VLC"]).liveModel, .qwen3_1B7, "défaut live : qwen3-1.7b")
+    // --- Modèle EN du live : défaut 4b (qualité, sans ralentissement
+    //     ressenti) ; `--modele` explicite respecté ; le défaut offline
+    //     (8b) reste inchangé.
+    checkEqual(parse(["live", "--app", "VLC"]).liveModel, .qwen3_4B, "défaut live : qwen3-4b")
     checkEqual(parse(["live", "--app", "VLC", "--modele", "qwen3-8b"]).liveModel, .qwen3_8B, "live : --modele explicite")
     checkEqual(parse(["live", "--app", "VLC", "--modele", "qwen3-4b"]).liveModel, .qwen3_4B, "live : --modele 4b")
     checkEqual(parse(["traduire", "video.mp4"]).model, .qwen3_8B, "défaut offline inchangé (8b)")
@@ -749,15 +750,17 @@ private func runPausePlannerChecks() {
     // Silenc trop court → nil.
     var planner2 = LivePausePlanner()
     checkEqual(planner2.observe(windowStart: 0, available: at(2.0), trailingSilenceSeconds: 0.2, speechStart: 0), nil, "planner : pause de 0,2 s → nil")
-    // Filet dur : fenêtre ≥ 15 s → .forced (même à vide).
+    // Filet dur : fenêtre ≥ 5 s → .forced (même à vide) — plan produit
+    // (fenêtre courte : les commits sont portés par la fin de phrase, le
+    // filet reste un cas extrême).
     var planner3 = LivePausePlanner()
-    checkEqual(planner3.observe(windowStart: 0, available: at(15), trailingSilenceSeconds: 0, speechStart: nil), .forced, "planner : fenêtre de 15 s vide → .forced")
-    // Parole continue ≥ 15 s → .forced.
+    checkEqual(planner3.observe(windowStart: 0, available: at(5), trailingSilenceSeconds: 0, speechStart: nil), .forced, "planner : fenêtre de 5 s vide → .forced")
+    // Parole continue ≥ 5 s → .forced.
     var planner4 = LivePausePlanner()
-    checkEqual(planner4.observe(windowStart: 0, available: at(15.2), trailingSilenceSeconds: 0, speechStart: 0), .forced, "planner : parole continue de 15,2 s → .forced")
-    // 14,9 s de parole continue → encore nil.
+    checkEqual(planner4.observe(windowStart: 0, available: at(5.2), trailingSilenceSeconds: 0, speechStart: 0), .forced, "planner : parole continue de 5,2 s → .forced")
+    // 4,9 s de parole continue → encore nil.
     var planner5 = LivePausePlanner()
-    checkEqual(planner5.observe(windowStart: 0, available: at(14.9), trailingSilenceSeconds: 0, speechStart: 0), nil, "planner : parole continue de 14,9 s → nil")
+    checkEqual(planner5.observe(windowStart: 0, available: at(4.9), trailingSilenceSeconds: 0, speechStart: 0), nil, "planner : parole continue de 4,9 s → nil")
     // Persistance entre observations (début de phrase mémorisé) :
     // 1re observation avant le début de la parole, 2e après.
     var planner6 = LivePausePlanner()
@@ -768,6 +771,14 @@ private func runPausePlannerChecks() {
     checkEqual(planner7.observe(windowStart: 0, available: at(2.0), trailingSilenceSeconds: 0.5, speechStart: 0), .pause, "planner : commit")
     planner7.reset()
     checkEqual(planner7.observe(windowStart: at(2.0), available: at(2.5), trailingSilenceSeconds: 0, speechStart: at(2.0)), nil, "planner : après reset, phrase de 0,5 s → nil")
+    // Fin de phrase par PONCTUATION dans le texte roulant (latestText,
+    // segment Apple) → .pause, sans attendre le silence (plan produit).
+    var planner8 = LivePausePlanner()
+    checkEqual(planner8.observe(windowStart: 0, available: at(4.0), trailingSilenceSeconds: 0.0, speechStart: 0, latestText: "はい。"), .pause, "planner : ponctuation finale 。 → .pause (sans silence)")
+    var planner9 = LivePausePlanner()
+    checkEqual(planner9.observe(windowStart: 0, available: at(4.0), trailingSilenceSeconds: 0.0, speechStart: 0, latestText: "ありがとうございます。"), .pause, "planner : fin de phrase (。) → .pause")
+    var planner10 = LivePausePlanner()
+    checkEqual(planner10.observe(windowStart: 0, available: at(4.0), trailingSilenceSeconds: 0.0, speechStart: 0, latestText: "こんにちは"), nil, "planner : texte non terminal, sans silence → nil")
 
     // firstSpeechSample (VAD de fenêtre, RMS) :
     let frame = LiveEndpointing.frameSamples
