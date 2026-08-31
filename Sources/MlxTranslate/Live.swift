@@ -294,9 +294,9 @@ final class LivePreviewTask: @unchecked Sendable {
         // traduction de 1–2 caractères) ; fin terminale → traduction
         // immédiate (la phrase est complète).
         guard ja != lastTranslatedJA,
-              Date().timeIntervalSince(lastTranslateTime) >= 0.25,
+              Date().timeIntervalSince(lastTranslateTime) >= 0.15,
               !ja.isEmpty,
-              (ja.count >= 4 || LiveSemanticEndpointer.isTerminalJapanese(ja)) else { return }
+              (ja.count >= 2 || LiveSemanticEndpointer.isTerminalJapanese(ja)) else { return }
         do {
             let started = Date()
             let en = try await translation.translate(ja)
@@ -431,6 +431,11 @@ final class LivePreviewTask: @unchecked Sendable {
         }
         committedTextLength = min(committedTextLength, rollingJA.count)
         pendingCutSample = throughSample
+        let suffixNow = String(rollingJA.dropFirst(committedTextLength))
+        LiveDebug.log(
+            "TRIM \(jumped ? "instantané (finalisation a déjà franchi la coupe)" : "différé (Apple en retard)") "
+            + "suffixe post-commit=\"\(suffixNow.prefix(40))\" (seq \(seq))"
+        )
         jaLock.unlock()
     }
 
