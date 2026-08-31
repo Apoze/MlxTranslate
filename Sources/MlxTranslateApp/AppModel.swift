@@ -153,11 +153,13 @@ final class AppModel: ObservableObject {
             liveApp = app
         }
         // Test visuel de la barre de superposition (sans lancer de live) :
-        // deux finaux — un court, un long (enveloppe + rétrécissement de
-        // police + hauteur dynamique) — pour vérifier la fenêtre de 2 lignes.
+        // trois finaux (les deux plus récents restent visibles, le plus
+        // ancien défile hors de la barre) — pour vérifier le défilement de
+        // la barre 3 lignes (2 finalisés + 1 live).
         if env["MLXTRANSLATE_GUI_TEST_OVERLAY"] != nil {
             overlay.commitFinal("The team finished the last part of the quarterly report an hour ago, and the manager asked everyone to stay until the numbers have been double checked against the client spreadsheet before we can send the final version over tomorrow morning")
             overlay.commitFinal("I promised to pick up the kids from soccer practice at five, then drive home before it starts to rain, so I will be late to dinner unless someone can cover the first part of the evening cleanup for me this week")
+            overlay.commitFinal("The third report is ready, the figures have been double checked, and the final version goes out tomorrow morning")
         }
         // Auto-démarrage du live (test / script) : après un court délai pour laisser
         // l'app se poser.
@@ -274,10 +276,14 @@ final class AppModel: ObservableObject {
                 // on ne le réutilise que si le modèle sélectionné est le même.
                 config.preloadedTranslator = (model == .qwen3_4B) ? preloader.translator : nil
                 MlxTranslate.LivePreloadedTranslation.service = preloader.translation
-                // Lignes de la superposition (2 lignes, `LiveOverlayState`) :
-                // l'APERÇU roulant (Apple basse latence + snapshots Qwen)
-                // reste en bas (blanc) ; le FINAL EN stable s'engage et fait
-                // défiler la fenêtre (2 finaux max, le plus ancien s'estompe).
+                // Barre de superposition (3 lignes, `LiveOverlayState`) :
+                // la ligne LIVE (en bas) est la ligne en cours — l'aperçu
+                // roulant (Apple basse latence ou snapshots Qwen) et le
+                // stream du final MLX (les chunks cumulatifs la remplacent
+                // sur place : la ligne s'améliore au fur et à mesure, sans
+                // saut de source) ; les FINAUX stables s'engagent en haut
+                // (2 lignes finalisées, le plus ancien défile hors de la
+                // barre).
                 config.onApplePreview = { [weak weakModel = self] text, _ in
                     MlxTranslate.LiveDebug.log("onApplePreview text=\"\(text)\"")
                     DispatchQueue.main.async {
@@ -288,12 +294,18 @@ final class AppModel: ObservableObject {
                 }
                 config.onLine = { [weak weakModel = self] text, isFinal in
                     MlxTranslate.LiveDebug.log("onLine isFinal=\(isFinal) text=\"\(text)\"")
-                    // Les chunks MLX (isFinal=false) n'alimentent que stderr ; seul le
-                    // final engagé (isFinal=true) s'empile dans les lignes stables.
-                    guard isFinal else { return }
                     DispatchQueue.main.async {
                         MainActor.assumeIsolated {
-                            weakModel?.overlay.commitFinal(text)
+                            if isFinal {
+                                weakModel?.overlay.commitFinal(text)
+                            } else {
+                                // Chunks du stream de final MLX (cumulatifs) :
+                                // ils remplacent la ligne live sur place —
+                                // pendant la passe de qualité, la ligne
+                                // progresse visiblement au lieu de geler puis
+                                // de sauter.
+                                weakModel?.overlay.streamingChunk(text)
+                            }
                         }
                     }
                 }

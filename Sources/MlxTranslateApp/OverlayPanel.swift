@@ -1,28 +1,32 @@
 import AppKit
 @testable import MlxTranslate
 
-/// Superposition de sous-titres live : une NSPanel sans bordure, transparente,
-/// flottante (au-dessus des autres fenêtres) et non-activante (ne vole pas la
-/// focus), **déplaçable** (isMovableByWindowBackground) — style « barre YouTube ».
-/// Détachée de la fenêtre principale ; sa position est mémorisée (UserDefaults).
+/// Superposition de sous-titres live : une NSPanel sans bordure,
+/// transparente, flottante (au-dessus des autres fenêtres) et
+/// non-activante (ne vole pas le focus), **déplaçable**
+/// (isMovableByWindowBackground) — style « barre YouTube ». Détachée de
+/// la fenêtre principale ; sa position est mémorisée (UserDefaults).
 ///
-/// Contenu (2 lignes, pilotées par la machine d'état pure `LiveOverlayState`) :
-/// - **haut (atténué, alpha 0,6)** : le final stable précédent ;
-/// - **bas (blanc)** : l'aperçu roulant de la clause en cours, ou le final
-///   le plus récent après commit.
+/// Contenu (barre de 3 lignes, pilotée par la machine d'état pure
+/// `LiveOverlayState`) :
+/// - **bas (ligne live)** : la ligne en cours — l'aperçu roulant de la
+///   clause en formation, puis le stream du final MLX (les chunks
+///   cumulatifs la remplacent sur place : la ligne s'améliore au fur et
+///   à mesure, sans saut de source) ;
+/// - **haut (2 lignes finalisées)** : les finaux stables les plus
+///   récents ; à chaque engagement, le plus ancien défile hors de la
+///   barre (défilement automatique vers le haut).
 ///
-/// Chaque ligne enveloppe jusqu'à 3 lignes, la police rétrécit 20 → 14 pt
-/// pour tenir, troncature à 250 caractères. Hauteur dynamique 64…192 px,
-/// **arrimée en bas** : le bas du panneau reste fixe, le contenu pousse vers
-/// le haut (hystérésis : la hauteur ne fait que croître entre aperçus,
-/// recomputation complète à chaque commit final).
+/// Chaque ligne : UNE ligne visuelle (sans enveloppement), police
+/// rétrécie automatiquement 20 → 14 pt pour tenir, troncature dure avec
+/// « … ». Hauteur du panneau CONSTANTE (96 px = 3 × 32 pt), arrimée en
+/// bas (le bas du panneau ne bouge jamais).
 final class OverlayController: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
     private var state = LiveOverlayState()
-    private var topLabel: NSTextField!    // final précédent (atténué)
-    private var bottomLabel: NSTextField! // courant (blanc)
-    private var topHeight: NSLayoutConstraint!
-    private var bottomHeight: NSLayoutConstraint!
+    private var topLabel: NSTextField!     // finalisé le plus ancien
+    private var midLabel: NSTextField!     // finalisé le plus récent
+    private var bottomLabel: NSTextField!  // ligne live
     // Par défaut, la superposition est centrée horizontalement (barre de
     // sous-titres classique). Le fond est déplaçable (clic + glisser) : la
     // position complète choisie est mémorisée ; l'inset vertical l'est aussi,
@@ -43,9 +47,9 @@ final class OverlayController: NSObject, NSWindowDelegate {
         l.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
         l.textColor = .white
         l.alignment = .center
-        l.maximumNumberOfLines = 3
-        l.lineBreakMode = .byWordWrapping
-        (l.cell as? NSTextFieldCell)?.wraps = true
+        l.maximumNumberOfLines = 1
+        l.lineBreakMode = .byTruncatingTail
+        (l.cell as? NSTextFieldCell)?.wraps = false
         (l.cell as? NSTextFieldCell)?.isScrollable = false
         l.translatesAutoresizingMaskIntoConstraints = false
         return l
@@ -53,9 +57,10 @@ final class OverlayController: NSObject, NSWindowDelegate {
 
     private func build() {
         topLabel = makeLabel()
+        midLabel = makeLabel()
         bottomLabel = makeLabel()
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: Self.panelWidth, height: 64),
+            contentRect: NSRect(x: 0, y: 0, width: Self.panelWidth, height: LiveOverlayState.barHeight),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false)
         panel.isFloatingPanel = true
@@ -72,25 +77,29 @@ final class OverlayController: NSObject, NSWindowDelegate {
         content.wantsLayer = true
         // Largeur verrouillée : sans cette contrainte, une fenêtre borderless
         // redimensionnée à la taille « fitting » du contenu (≈ 0 avec des
-        // labels vides) s'effondrait à quelques points de large.
+        // labels vides) s'effondrerait à quelques points de large.
         content.translatesAutoresizingMaskIntoConstraints = false
         content.widthAnchor.constraint(equalToConstant: Self.panelWidth).isActive = true
         content.addSubview(topLabel)
+        content.addSubview(midLabel)
         content.addSubview(bottomLabel)
-        topLabel.textColor = .white.withAlphaComponent(0.6)   // final précédent : s'estompe
-        // Bloc arrimé EN BAS : le label bas au bord inférieur du panneau, le
-        // haut au-dessus — quand la hauteur croît, le bas reste fixe.
+        // Les 3 labels empilés, arrimés EN BAS : le label live au bord
+        // inférieur du panneau, les finalisés au-dessus — la hauteur de la
+        // barre est constante, la géométrie est fixée une fois pour toutes.
         NSLayoutConstraint.activate([
             bottomLabel.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             bottomLabel.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            topLabel.bottomAnchor.constraint(equalTo: bottomLabel.topAnchor),
+            midLabel.bottomAnchor.constraint(equalTo: bottomLabel.topAnchor),
+            midLabel.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            topLabel.bottomAnchor.constraint(equalTo: midLabel.topAnchor),
             topLabel.centerXAnchor.constraint(equalTo: content.centerXAnchor),
             bottomLabel.widthAnchor.constraint(equalToConstant: Self.contentWidth),
+            midLabel.widthAnchor.constraint(equalToConstant: Self.contentWidth),
             topLabel.widthAnchor.constraint(equalToConstant: Self.contentWidth),
+            bottomLabel.heightAnchor.constraint(equalToConstant: Self.lineHeight),
+            midLabel.heightAnchor.constraint(equalToConstant: Self.lineHeight),
+            topLabel.heightAnchor.constraint(equalToConstant: Self.lineHeight),
         ])
-        topHeight = topLabel.heightAnchor.constraint(equalToConstant: Self.lineHeight)
-        bottomHeight = bottomLabel.heightAnchor.constraint(equalToConstant: Self.lineHeight)
-        NSLayoutConstraint.activate([topHeight, bottomHeight])
 
         panel.contentView = content
         panel.delegate = self
@@ -99,8 +108,9 @@ final class OverlayController: NSObject, NSWindowDelegate {
 
     // MARK: - Contenu
 
-    /// Aperçu roulant (clause en cours) : ligne basse ; la hauteur ne fait
-    /// que croître (hystérésis live).
+    /// Aperçu roulant (clause en cours) : ligne live (sur place) ; pendant
+    /// le stream d'un final, l'aperçu est stagé (il prend la ligne live au
+    /// prochain engagement).
     func showPreview(_ text: String) {
         LiveDebug.log("SUPERPOSITION aperçu text=\"\(text)\"")
         state.showPreview(text)
@@ -108,8 +118,18 @@ final class OverlayController: NSObject, NSWindowDelegate {
         if state.hasContent { show() }
     }
 
-    /// Un final EN stable s'engage : défile la fenêtre de 2 lignes et
-    /// recompute la mise en page en totalité (la hauteur peut rétrécir).
+    /// Chunk du stream de final MLX (cumulatif) : remplace la ligne live
+    /// sur place — la ligne « en cours » s'améliore chunk par chunk.
+    func streamingChunk(_ text: String) {
+        LiveDebug.log("SUPERPOSITION stream final text=\"\(text)\"")
+        state.streamingChunk(text)
+        applyLayout()
+        show()
+    }
+
+    /// Un final EN stable s'engage : prend le slot du haut, le plus ancien
+    /// défile hors de la barre, la ligne live est vidée (ou reprise par la
+    /// preview stagée de la phrase suivante).
     func commitFinal(_ text: String) {
         LiveDebug.log("SUPERPOSITION final engagé text=\"\(text)\"")
         state.commitFinal(text)
@@ -117,28 +137,19 @@ final class OverlayController: NSObject, NSWindowDelegate {
         show()
     }
 
-    /// Vide la fenêtre (finaux + aperçu), remet la hauteur au minimum et
-    /// masque la barre.
+    /// Vide la barre (finalisés + ligne live + stagé) et masque la superposition.
     func reset() {
         state.reset()
-        topLabel.stringValue = ""
-        bottomLabel.stringValue = ""
-        topLabel.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
-        bottomLabel.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
-        topLabel.maximumNumberOfLines = 1
-        bottomLabel.maximumNumberOfLines = 1
-        topHeight.constant = Self.lineHeight
-        bottomHeight.constant = Self.lineHeight
-        setPanelHeight(64)
+        applyLayout()
         hide()
     }
 
     // MARK: - Compat (pré-remplissage de test, effacement)
 
     /// Point d'entrée unifié.
-    /// - `isFinal == false` : l'aperçu roulant (bas).
-    /// - `isFinal == true` : un final s'engage (haut) ; `text` vide → réinitialise
-    ///   la fenêtre et masque la barre.
+    /// - `isFinal == false` : l'aperçu roulant (ligne live) ;
+    /// - `isFinal == true` : un final s'engage ; `text` vide → réinitialise
+    ///   la barre et masque la superposition.
     func set(text: String, isFinal: Bool) {
         if isFinal {
             if text.isEmpty { reset() } else { commitFinal(text) }
@@ -160,54 +171,36 @@ final class OverlayController: NSObject, NSWindowDelegate {
             position(panel)
             panel.orderFrontRegardless()
         }
-        // Log fiable : après orderFront + résolution du graphe, le frame des
-        // labels est celui réellement rendu à l'écran.
-        panel.contentView?.layoutSubtreeIfNeeded()
-        LiveDebug.log("SUPERPOSITION affiché frame=\(panel.frame) topLabel=\(topLabel.frame) bottomLabel=\(bottomLabel.frame)")
+        LiveDebug.log("SUPERPOSITION affiché frame=\(panel.frame)")
     }
 
     func hide() {
         panel?.orderOut(nil)
     }
 
-    /// Applique la mise en page calculée par `LiveOverlayState` : polices,
-    /// lignes, hauteurs des labels et hauteur du panneau (bas fixe).
+    /// Applique la mise en page calculée par `LiveOverlayState` : textes et
+    /// polices des 3 slots (la hauteur du panneau est constante).
     private func applyLayout() {
         let l = state.layout
-        topLabel.stringValue = l.topText
-        bottomLabel.stringValue = l.bottomText
-        topLabel.font = NSFont.systemFont(ofSize: l.topFont, weight: .semibold)
-        bottomLabel.font = NSFont.systemFont(ofSize: l.bottomFont, weight: .semibold)
-        topLabel.maximumNumberOfLines = max(1, l.topLines)
-        bottomLabel.maximumNumberOfLines = max(1, l.bottomLines)
-        topHeight.constant = CGFloat(l.topLines) * Self.lineHeight
-        bottomHeight.constant = CGFloat(l.bottomLines) * Self.lineHeight
-        // Résout le sous-arbre AVANT de redimensionner le panneau : la
-        // fenêtre borderless suit la taille fitting du contenu, il faut que
-        // celle-ci soit déjà la bonne pour que le repositionnement bas fixe
-        // parte de la bonne géométrie.
-        panel?.contentView?.layoutSubtreeIfNeeded()
-        setPanelHeight(l.panelHeight)
-        panel?.contentView?.layoutSubtreeIfNeeded()
-        LiveDebug.log("SUPERPOSITION layout top[\"\(l.topText.prefix(20))\" \(l.topFont)pt \(l.topLines)L] bottom[\"\(l.bottomText.prefix(20))\" \(l.bottomFont)pt \(l.bottomLines)L] topLabel=\(topLabel.frame) bottomLabel=\(bottomLabel.frame) content=\(String(describing: panel?.contentView?.frame))")
-    }
-
-    /// Change la hauteur du panneau en gardant le BAS fixe (arrimage bas :
-    /// l'origine — bas-gauche en coordonnées AppKit — ne bouge pas).
-    private func setPanelHeight(_ height: CGFloat) {
-        guard let panel else { return }
-        var frame = panel.frame
-        let newBottom = frame.origin.y
-        frame.size.height = height
-        frame.origin.y = newBottom
-        panel.setFrame(frame, display: true)
+        topLabel.stringValue = l.lines[0]
+        midLabel.stringValue = l.lines[1]
+        bottomLabel.stringValue = l.lines[2]
+        topLabel.font = NSFont.systemFont(ofSize: l.fonts[0], weight: .semibold)
+        midLabel.font = NSFont.systemFont(ofSize: l.fonts[1], weight: .semibold)
+        bottomLabel.font = NSFont.systemFont(ofSize: l.fonts[2], weight: .semibold)
+        LiveDebug.log(
+            "SUPERPOSITION layout [\"\(l.lines[0].prefix(24))\" \(l.fonts[0])pt | "
+            + "\"\(l.lines[1].prefix(24))\" \(l.fonts[1])pt | "
+            + "\"\(l.lines[2].prefix(24))\" \(l.fonts[2])pt]"
+        )
     }
 
     // Position du panneau :
     // - Si l'utilisateur l'a déplacé (position complète mémorisée), on la
     //   respecte — le fond est déplaçable (isMovableByWindowBackground).
     // - Sinon, par défaut : centré horizontalement sur l'écran principal, avec
-    //   un inset vertical (mémorisé, sinon 40 pt).
+    //   un inset vertical (mémorisé, sinon 40 pt). La hauteur étant
+    //   constante, le bas du panneau est arrimé à l'inset.
     private func position(_ panel: NSPanel) {
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         let size = panel.frame.size

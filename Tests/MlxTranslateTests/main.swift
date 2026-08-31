@@ -571,36 +571,56 @@ private func runPreviewMonotoneChecks() {
 // MARK: - Superposition live (machine d'état pure + résolveur de mise en page)
 
 private func runLiveOverlayStateChecks() {
-    // Contenu : fenêtre de 2 finaux + aperçu roulant.
+    // Barre 3 lignes : 2 finalisés + 1 live (arrimée en bas).
     var s = LiveOverlayState()
     check(!s.hasContent, "overlay : vide au démarrage")
-    checkEqual(s.topText, "", "overlay : ligne haute vide")
-    checkEqual(s.bottomText, "", "overlay : ligne basse vide")
+    checkEqual(s.lines, ["", "", ""], "overlay : 3 slots vides")
 
     s.commitFinal("Un")
-    checkEqual(s.bottomText, "Un", "overlay : final en bas (blanc)")
-    checkEqual(s.topText, "", "overlay : pas encore de final précédent")
+    checkEqual(s.lines, ["", "Un", ""], "overlay : finalisé en slot moyen (arrimage bas)")
 
     s.showPreview("Roulant…")
-    checkEqual(s.bottomText, "Roulant…", "overlay : l'aperçu prend la ligne basse")
-    checkEqual(s.topText, "Un", "overlay : le final précédent s'estompe en haut")
+    checkEqual(s.lines, ["", "Un", "Roulant…"], "overlay : l'aperçu prend la ligne live (bas)")
 
     s.commitFinal("Deux")
-    checkEqual(s.bottomText, "Deux", "overlay : final 2 en bas")
-    checkEqual(s.topText, "Un", "overlay : final 1 défile en haut")
+    checkEqual(s.lines, ["Un", "Deux", ""], "overlay : final s'engage et défile, live vidée")
 
     s.commitFinal("Trois")
-    checkEqual(s.topText, "Deux", "overlay : fenêtre de 2 — final 1 sort")
-    checkEqual(s.bottomText, "Trois", "overlay : final 3 en bas")
-
-    s.showPreview("")
-    checkEqual(s.bottomText, "Trois", "overlay : aperçu vide → retour au final")
-    checkEqual(s.topText, "Deux", "overlay : haut inchangé (final précédent)")
+    checkEqual(s.lines, ["Deux", "Trois", ""], "overlay : fenêtre de 2 finaux — le plus ancien sort")
 
     s.reset()
-    check(!s.hasContent, "overlay : reset vide la fenêtre")
+    check(!s.hasContent, "overlay : reset vide la barre")
 
-    // Résolveur : estimation des lignes + rétrécissement de police.
+    // Streaming : les chunks MLX prennent la ligne live sur place ; les
+    // previews Apple sont stagées pendant le stream et reprennent la ligne
+    // live à l'engagement du final.
+    var m = LiveOverlayState()
+    m.commitFinal("Base")
+    m.streamingChunk("The team")
+    checkEqual(m.lines, ["", "Base", "The team"], "overlay : chunk stream sur la ligne live")
+    m.showPreview("Aperçu Apple")
+    checkEqual(m.lines, ["", "Base", "The team"], "overlay : aperçu stagé pendant le stream")
+    m.streamingChunk("The team worked hard")
+    checkEqual(m.lines, ["", "Base", "The team worked hard"], "overlay : le stream remplace sur place")
+    m.commitFinal("The team worked hard, together")
+    checkEqual(m.lines, ["Base", "The team worked hard, together", "Aperçu Apple"],
+               "overlay : final s'engage ; l'aperçu stagé reprend la ligne live")
+
+    // Sans aperçu stagé : la ligne live est simplement vidée.
+    var m2 = LiveOverlayState()
+    m2.commitFinal("Seul")
+    m2.streamingChunk("Chunk")
+    m2.commitFinal("Final streamé")
+    checkEqual(m2.lines, ["Seul", "Final streamé", ""], "overlay : sans stagé → live vidée")
+
+    // Final vide : vide le stream sans s'engager.
+    var m3 = LiveOverlayState()
+    m3.commitFinal("A")
+    m3.streamingChunk("B")
+    m3.commitFinal("")
+    checkEqual(m3.lines, ["", "A", ""], "overlay : final vide → live vidée (finalisé reste arrimé en bas)")
+
+    // Résolveur : fitting des lignes + rétrécissement de police.
     let probe = LiveOverlayState()
     checkEqual(probe.estimatedLines("", font: 20), 1, "overlay : texte vide = 1 ligne de réserve")
     checkEqual(probe.estimatedLines(String(repeating: "a", count: 79), font: 20), 1,
@@ -608,66 +628,25 @@ private func runLiveOverlayStateChecks() {
     checkEqual(probe.estimatedLines(String(repeating: "a", count: 80), font: 20), 2,
                "overlay : 80 car. = 2 lignes à 20 pt")
     checkEqual(probe.fittedFont(""), 20, "overlay : police max si vide")
-    checkEqual(probe.fittedFont(String(repeating: "a", count: 238)), 19,
-               "overlay : 238 car. → rétrécit à 19 pt")
-    checkEqual(probe.fittedFont(String(repeating: "a", count: 300)), 15,
-               "overlay : 300 car. → 15 pt (plancher 14 pt)")
-    checkEqual(probe.truncated(String(repeating: "a", count: 250)).count, 250,
-               "overlay : 250 car. non tronqués")
-    checkEqual(probe.truncated(String(repeating: "a", count: 251)).count, 251,
-               "overlay : 251 car. → troncature + « … »")
 
-    // Mise en page : hauteur + hystérésis.
+    // Fitting une ligne : 90 car. → 17 pt, sans troncature.
+    let (t1, f1) = probe.fittedLine(String(repeating: "a", count: 90))
+    checkEqual(f1, 17, "overlay : 90 car. → rétrécit à 17 pt")
+    checkEqual(t1.count, 90, "overlay : 90 car. tient sans troncature")
+    // 200 car. → plancher 14 pt + troncature à 113 car. (114 avec « … »).
+    let (t2, f2) = probe.fittedLine(String(repeating: "b", count: 200))
+    checkEqual(f2, 14, "overlay : très long → plancher 14 pt")
+    checkEqual(t2.count, 114, "overlay : troncature à la capacité 14 pt + « … »")
+
+    // Mise en page : hauteur constante, lignes tronquées.
     var l = LiveOverlayState()
-    checkClose(l.layout.panelHeight, 64, accuracy: 0.01, "overlay : hauteur par défaut 64")
-    l.showPreview("Court")
-    checkEqual(l.layout.bottomFont, 20, "overlay : texte court reste à 20 pt")
-    checkEqual(l.layout.bottomLines, 1, "overlay : texte court sur 1 ligne")
-
-    let long = String(repeating: "mot ", count: 63)   // 252 car. → plafonné 250
-    l.showPreview(long)
-    checkEqual(l.layout.bottomText.count, 251, "overlay : plafonné à 250 + « … »")
-    check(l.layout.bottomFont < 20, "overlay : texte long rétrécit (< 20 pt)")
-    check(l.layout.bottomLines <= 3, "overlay : jamais plus de 3 lignes")
-    check(l.layout.panelHeight <= 192, "overlay : hauteur plafonnée à 192")
-
-    // Hystérésis : la hauteur ne fait que croître entre aperçus.
-    let tall = l.layout.panelHeight
+    checkClose(Double(l.layout.panelHeight), 96, accuracy: 0.01, "overlay : hauteur constante 96 (3 lignes)")
+    l.commitFinal(String(repeating: "c", count: 200))
+    checkEqual(l.layout.lines[1].count, 114, "overlay : final long tronqué sur une ligne")
+    checkClose(Double(l.layout.panelHeight), 96, accuracy: 0.01, "overlay : la hauteur reste constante")
     l.showPreview("Hi")
-    checkClose(l.layout.panelHeight, tall, accuracy: 0.01,
-               "overlay : pas de rétrécissement pendant les aperçus (hystérésis)")
-
-    // Recomputation complète au commit : la hauteur peut rétrécir.
-    l.commitFinal("Fin")
-    checkClose(l.layout.panelHeight, 64, accuracy: 0.01,
-               "overlay : commit → recomputation (retour au minimum ici)")
-
-    // Bornes max : 3 lignes haut + 3 lignes bas = 192.
-    var m = LiveOverlayState()
-    let a = String(repeating: "premier terme ", count: 18)   // ~252 car. → 250
-    let b = String(repeating: "second terme ", count: 18)
-    m.commitFinal(a)
-    m.commitFinal(b)
-    checkEqual(Int(m.layout.panelHeight), 192, "overlay : 3+3 lignes = 192 px")
-    checkEqual(m.layout.topLines, 3, "overlay : ligne haute sur 3 lignes")
-    checkEqual(m.layout.bottomLines, 3, "overlay : ligne basse sur 3 lignes")
-
-    // Garde monotone : la ligne de preview ne rétrécit jamais entre deux
-    // passes (le début d'une nouvelle passe de re-traduction ne remplace pas
-    // le texte complet précédent ; elle tient jusqu'au rattrapage ou au commit).
-    var m2 = LiveOverlayState()
-    m2.showPreview("Hello, I'm doing well")
-    checkEqual(m2.bottomText, "Hello, I'm doing well", "overlay : preview affichée")
-    m2.showPreview("Hello,")
-    checkEqual(m2.bottomText, "Hello, I'm doing well", "overlay : rétrécissement retenu (monotone)")
-    m2.showPreview("Hello, I'm doing well, thank you")
-    checkEqual(m2.bottomText, "Hello, I'm doing well, thank you", "overlay : extension affichée")
-    m2.showPreview("")
-    checkEqual(m2.bottomText, "Hello, I'm doing well, thank you", "overlay : aperçu vide n'efface pas la ligne")
-    m2.commitFinal("Fin")
-    checkEqual(m2.bottomText, "Fin", "overlay : commit efface la ligne de preview")
-    m2.showPreview("Hi")
-    checkEqual(m2.bottomText, "Hi", "overlay : post-commit, preview courte acceptée (garde remise à zéro)")
+    checkEqual(l.layout.lines[2], "Hi", "overlay : ligne live en slot bas")
+    checkClose(Double(l.layout.panelHeight), 96, accuracy: 0.01, "overlay : plus aucun jump de hauteur")
 }
 
 
